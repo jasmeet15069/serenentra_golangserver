@@ -1,0 +1,86 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: always
+    environment:
+      POSTGRES_USER: hotel
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: hotel_harmony
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hotel -d hotel_harmony"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - hms-internal
+
+  redis:
+    image: redis:7-alpine
+    restart: always
+    command: redis-server --save 60 1 --loglevel warning
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - hms-internal
+
+  api:
+    build:
+      context: ../..
+      dockerfile: deployments/docker/Dockerfile
+    restart: always
+    env_file: ../../.env
+    environment:
+      DATABASE_URL: postgres://hotel:${POSTGRES_PASSWORD}@postgres:5432/hotel_harmony?sslmode=disable
+      REDIS_URL: redis://redis:6379/0
+      APP_ENV: production
+    ports:
+      - "127.0.0.1:8787:8787"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "8787"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    networks:
+      - hms-internal
+
+  portal:
+    build:
+      context: ../../../HMS admin portal
+      dockerfile: Dockerfile
+    restart: always
+    environment:
+      HOST: 0.0.0.0
+      PORT: "3001"
+      NITRO_HOST: 0.0.0.0
+      NITRO_PORT: "3001"
+    ports:
+      - "127.0.0.1:3001:3001"
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"require('http').get('http://localhost:3001/',(r)=>process.exit(r.statusCode<500?0:1)).on('error',()=>process.exit(1))\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+networks:
+  hms-internal:
+    driver: bridge
+
+volumes:
+  pgdata:
+  redisdata:

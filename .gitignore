@@ -1,0 +1,22 @@
+.env
+.env.*
+!.env.example
+
+*.log
+*.out
+*.err
+
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+bin/
+dist/
+tmp/
+# compiled server binary at repo root (built artifact, not source)
+/hms-api
+coverage.out
+.DS_Store
+Thumbs.db
