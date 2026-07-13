@@ -937,6 +937,22 @@ func (h *POSHandler) AddBillPayment(c *fiber.Ctx) error {
 	if req.Method == "cash" && changeDue > 0 {
 		credited = req.Amount // amount already excludes change (tendered - change)
 	}
+
+	// Mirror the payment into the main `payments` table so restaurant revenue is
+	// visible on the dashboard. The dashboard (dashboard_repository.go) reads
+	// revenue from `payments`, NOT `bill_payments`, so dine-in sales were invisible
+	// in revenue_today / the revenue trend / the department breakdown. category
+	// 'fnb' feeds the F&B slice; status 'completed' makes revenue_today count it.
+	// In-tx so it is atomic with the bill payment — a bill payment that recorded
+	// must also show as revenue, and vice-versa. No double-count: `bill_payments`
+	// is never summed for reporting (only read per-single-bill for the receipt).
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO payments (id, hotel_id, payment_number, amount, payment_method, status, processed_by, notes, category, created_at)
+		VALUES ($1,$2,$3,$4,$5,'completed',$6,$7,'fnb',now())`,
+		uuid.New(), hotelID, paymentNumber, credited, req.Method, h.userID(c), "Dine-in bill "+b.BillNumber); err != nil {
+		return response.Error(c, fiber.StatusInternalServerError, "failed to record revenue: "+err.Error())
+	}
+
 	b.AmountPaid = round2(b.AmountPaid + credited)
 	b.AmountDue = round2(b.TotalAmount - b.AmountPaid)
 

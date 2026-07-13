@@ -439,7 +439,7 @@ func (h *CompatHandler) Delete(c *fiber.Ctx) error {
 			if id == "" {
 				return response.Error(c, fiber.StatusBadRequest, "id filter is required")
 			}
-			if _, err := h.pool.Exec(c.Context(), `DELETE FROM rooms WHERE id = $1 AND hotel_id = $2`, id, h.hotelID(c)); err != nil {
+			if _, err := tenantPool(c, h.pool).Exec(c.Context(), `DELETE FROM rooms WHERE id = $1 AND hotel_id = $2`, id, h.hotelID(c)); err != nil {
 				return response.Error(c, fiber.StatusBadRequest, err.Error())
 			}
 			return response.OK(c, []map[string]interface{}{})
@@ -447,7 +447,7 @@ func (h *CompatHandler) Delete(c *fiber.Ctx) error {
 			if id == "" {
 				return response.Error(c, fiber.StatusBadRequest, "id filter is required")
 			}
-			if _, err := h.pool.Exec(c.Context(), `DELETE FROM guest_stays WHERE id = $1 AND hotel_id = $2`, id, h.hotelID(c)); err != nil {
+			if _, err := tenantPool(c, h.pool).Exec(c.Context(), `DELETE FROM guest_stays WHERE id = $1 AND hotel_id = $2`, id, h.hotelID(c)); err != nil {
 				return response.Error(c, fiber.StatusBadRequest, err.Error())
 			}
 			return response.OK(c, []map[string]interface{}{})
@@ -457,7 +457,7 @@ func (h *CompatHandler) Delete(c *fiber.Ctx) error {
 			if id == "" {
 				return response.Error(c, fiber.StatusBadRequest, "id filter is required")
 			}
-			if _, err := h.pool.Exec(c.Context(), fmt.Sprintf(`DELETE FROM %s WHERE id = $1 AND hotel_id = $2`, table), id, h.hotelID(c)); err != nil {
+			if _, err := tenantPool(c, h.pool).Exec(c.Context(), fmt.Sprintf(`DELETE FROM %s WHERE id = $1 AND hotel_id = $2`, table), id, h.hotelID(c)); err != nil {
 				return response.Error(c, fiber.StatusBadRequest, err.Error())
 			}
 			return response.OK(c, []map[string]interface{}{})
@@ -466,7 +466,7 @@ func (h *CompatHandler) Delete(c *fiber.Ctx) error {
 			if id == "" {
 				return response.Error(c, fiber.StatusBadRequest, "id filter is required")
 			}
-			if _, err := h.pool.Exec(c.Context(), fmt.Sprintf(`DELETE FROM %s WHERE id = $1`, table), id); err != nil {
+			if _, err := tenantPool(c, h.pool).Exec(c.Context(), fmt.Sprintf(`DELETE FROM %s WHERE id = $1`, table), id); err != nil {
 				return response.Error(c, fiber.StatusBadRequest, err.Error())
 			}
 			return response.OK(c, []map[string]interface{}{})
@@ -476,7 +476,7 @@ func (h *CompatHandler) Delete(c *fiber.Ctx) error {
 			return h.deleteByIDOrColumn(c, table, id, payload.Filters, "order_id")
 		case "user_roles":
 			if id != "" {
-				if _, err := h.pool.Exec(c.Context(), `DELETE FROM user_roles WHERE id = $1`, id); err != nil {
+				if _, err := tenantPool(c, h.pool).Exec(c.Context(), `DELETE FROM user_roles WHERE id = $1`, id); err != nil {
 					return response.Error(c, fiber.StatusBadRequest, err.Error())
 				}
 				return response.OK(c, []map[string]interface{}{})
@@ -486,7 +486,7 @@ func (h *CompatHandler) Delete(c *fiber.Ctx) error {
 			if userID == "" || role == "" {
 				return response.Error(c, fiber.StatusBadRequest, "id or user_id+role filters are required")
 			}
-			if _, err := h.pool.Exec(c.Context(), `DELETE FROM user_roles WHERE user_id = $1 AND role = $2`, userID, role); err != nil {
+			if _, err := tenantPool(c, h.pool).Exec(c.Context(), `DELETE FROM user_roles WHERE user_id = $1 AND role = $2`, userID, role); err != nil {
 				return response.Error(c, fiber.StatusBadRequest, err.Error())
 			}
 			return response.OK(c, []map[string]interface{}{})
@@ -550,7 +550,7 @@ func (h *CompatHandler) auditCompatMutation(c *fiber.Ctx, action, table, recordI
 	}
 
 	payload, _ := json.Marshal(details)
-	_, err = h.pool.Exec(c.Context(), `
+	_, err = tenantPool(c, h.pool).Exec(c.Context(), `
 		INSERT INTO audit_logs (
 			id, hotel_id, user_id, action, table_name, record_id, resource_type, resource_id,
 			new_data, user_agent, ai_triggered, created_at
@@ -689,7 +689,7 @@ func (h *CompatHandler) selectProfiles(c *fiber.Ctx, filters []compatFilter) err
 	}
 	q += " ORDER BY created_at DESC"
 
-	rows, err := h.pool.Query(c.Context(), q, args...)
+	rows, err := tenantPool(c, h.pool).Query(c.Context(), q, args...)
 	if err != nil {
 		return response.Error(c, fiber.StatusInternalServerError, err.Error())
 	}
@@ -731,7 +731,7 @@ func (h *CompatHandler) selectUserRoles(c *fiber.Ctx, filters []compatFilter) er
 	}
 	q += " ORDER BY created_at"
 
-	rows, err := h.pool.Query(c.Context(), q, args...)
+	rows, err := tenantPool(c, h.pool).Query(c.Context(), q, args...)
 	if err != nil {
 		return response.Error(c, fiber.StatusInternalServerError, err.Error())
 	}
@@ -756,7 +756,7 @@ func (h *CompatHandler) selectUserRoles(c *fiber.Ctx, filters []compatFilter) er
 
 func (h *CompatHandler) insertProfile(c *fiber.Ctx, v map[string]interface{}, single string) error {
 	id := uuid.New().String()
-	rows, err := h.pool.Query(c.Context(), `INSERT INTO profiles (id, user_id, full_name, phone, avatar_url, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,now(),now()) ON CONFLICT (user_id) DO UPDATE SET full_name = EXCLUDED.full_name, phone = EXCLUDED.phone, avatar_url = EXCLUDED.avatar_url, updated_at = now() RETURNING id, user_id, full_name, phone, avatar_url, created_at, updated_at`,
+	rows, err := tenantPool(c, h.pool).Query(c.Context(), `INSERT INTO profiles (id, user_id, full_name, phone, avatar_url, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,now(),now()) ON CONFLICT (user_id) DO UPDATE SET full_name = EXCLUDED.full_name, phone = EXCLUDED.phone, avatar_url = EXCLUDED.avatar_url, updated_at = now() RETURNING id, user_id, full_name, phone, avatar_url, created_at, updated_at`,
 		id, asString(v["user_id"]), asStringDefault(v["full_name"], "Guest"), nullableString(v["phone"]), nullableString(v["avatar_url"]))
 	if err != nil {
 		return response.Error(c, fiber.StatusBadRequest, err.Error())
@@ -774,7 +774,7 @@ func (h *CompatHandler) insertProfile(c *fiber.Ctx, v map[string]interface{}, si
 
 func (h *CompatHandler) insertUserRole(c *fiber.Ctx, v map[string]interface{}) error {
 	id := uuid.New().String()
-	rows, err := h.pool.Query(c.Context(), `INSERT INTO user_roles (id, user_id, role, created_at) VALUES ($1,$2,$3,now()) ON CONFLICT (user_id, role) DO UPDATE SET role = EXCLUDED.role RETURNING id, user_id, role, created_at`, id, asString(v["user_id"]), asString(v["role"]))
+	rows, err := tenantPool(c, h.pool).Query(c.Context(), `INSERT INTO user_roles (id, user_id, role, created_at) VALUES ($1,$2,$3,now()) ON CONFLICT (user_id, role) DO UPDATE SET role = EXCLUDED.role RETURNING id, user_id, role, created_at`, id, asString(v["user_id"]), asString(v["role"]))
 	if err != nil {
 		return response.Error(c, fiber.StatusBadRequest, err.Error())
 	}
@@ -811,7 +811,7 @@ func (h *CompatHandler) selectRooms(c *fiber.Ctx, filters []compatFilter) error 
 	}
 	q += " WHERE " + strings.Join(where, " AND ") + " ORDER BY floor, room_number"
 
-	rows, err := h.pool.Query(c.Context(), q, args...)
+	rows, err := tenantPool(c, h.pool).Query(c.Context(), q, args...)
 	if err != nil {
 		return response.Error(c, fiber.StatusInternalServerError, err.Error())
 	}
@@ -864,7 +864,7 @@ func (h *CompatHandler) selectGuestStays(c *fiber.Ctx, filters []compatFilter) e
 	}
 	q += " ORDER BY gs.check_in_date DESC"
 
-	rows, err := h.pool.Query(c.Context(), q, args...)
+	rows, err := tenantPool(c, h.pool).Query(c.Context(), q, args...)
 	if err != nil {
 		return response.Error(c, fiber.StatusInternalServerError, err.Error())
 	}
@@ -926,7 +926,7 @@ func (h *CompatHandler) insertRoom(c *fiber.Ctx, v map[string]interface{}) error
 	const q = `INSERT INTO rooms (id, hotel_id, room_number, room_type, floor, capacity, price_per_night, status, amenities, created_at, updated_at)
 	           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,now(),now())
 	           RETURNING id, room_number, room_type, floor, capacity, price_per_night, status, amenities, created_at, updated_at`
-	rows, err := h.pool.Query(c.Context(), q, id, h.hotelID(c), roomNumber, roomType, floor, capacity, price, status, amenities)
+	rows, err := tenantPool(c, h.pool).Query(c.Context(), q, id, h.hotelID(c), roomNumber, roomType, floor, capacity, price, status, amenities)
 	if err != nil {
 		return response.Error(c, fiber.StatusBadRequest, err.Error())
 	}
@@ -955,7 +955,7 @@ func (h *CompatHandler) insertGuestStay(c *fiber.Ctx, v map[string]interface{}) 
 	             total_amount, notes, created_by, created_at, updated_at
 	           ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,now(),now())
 	           RETURNING id`
-	if _, err := h.pool.Exec(c.Context(), q,
+	if _, err := tenantPool(c, h.pool).Exec(c.Context(), q,
 		id, h.hotelID(c), nullableString(v["guest_id"]), asString(v["room_id"]), guestName,
 		nullableString(v["guest_email"]), nullableString(v["guest_phone"]),
 		v["check_in_date"], v["check_out_date"], v["actual_check_in"], v["actual_check_out"],
@@ -983,7 +983,7 @@ func (h *CompatHandler) selectComplaints(c *fiber.Ctx, filters []compatFilter) e
 		  FROM complaints c
 		  LEFT JOIN guest_stays gs ON gs.id = c.guest_stay_id
 		  LEFT JOIN rooms r ON r.id = gs.room_id`
-	rows, err := h.pool.Query(c.Context(), q+" WHERE c.hotel_id = $1 ORDER BY c.created_at DESC", h.hotelID(c))
+	rows, err := tenantPool(c, h.pool).Query(c.Context(), q+" WHERE c.hotel_id = $1 ORDER BY c.created_at DESC", h.hotelID(c))
 	if err != nil {
 		return response.Error(c, fiber.StatusInternalServerError, err.Error())
 	}
@@ -1010,7 +1010,7 @@ func (h *CompatHandler) selectComplaints(c *fiber.Ctx, filters []compatFilter) e
 }
 
 func (h *CompatHandler) selectMenuCategories(c *fiber.Ctx, filters []compatFilter) error {
-	rows, err := h.pool.Query(c.Context(), `SELECT id, name, description, display_order, is_active, created_at FROM menu_categories WHERE hotel_id = $1 ORDER BY display_order, name`, h.hotelID(c))
+	rows, err := tenantPool(c, h.pool).Query(c.Context(), `SELECT id, name, description, display_order, is_active, created_at FROM menu_categories WHERE hotel_id = $1 ORDER BY display_order, name`, h.hotelID(c))
 	if err != nil {
 		return response.Error(c, fiber.StatusInternalServerError, err.Error())
 	}
@@ -1031,7 +1031,7 @@ func (h *CompatHandler) selectMenuCategories(c *fiber.Ctx, filters []compatFilte
 }
 
 func (h *CompatHandler) selectMenuItems(c *fiber.Ctx, filters []compatFilter) error {
-	rows, err := h.pool.Query(c.Context(), `SELECT mi.id, mi.category_id, mi.name, mi.description, mi.price, mi.image_url, mi.is_available, mi.preparation_time, mi.created_at, mi.updated_at, mc.name FROM menu_items mi LEFT JOIN menu_categories mc ON mc.id = mi.category_id WHERE mi.hotel_id = $1 ORDER BY mi.name`, h.hotelID(c))
+	rows, err := tenantPool(c, h.pool).Query(c.Context(), `SELECT mi.id, mi.category_id, mi.name, mi.description, mi.price, mi.image_url, mi.is_available, mi.preparation_time, mi.created_at, mi.updated_at, mc.name FROM menu_items mi LEFT JOIN menu_categories mc ON mc.id = mi.category_id WHERE mi.hotel_id = $1 ORDER BY mi.name`, h.hotelID(c))
 	if err != nil {
 		return response.Error(c, fiber.StatusInternalServerError, err.Error())
 	}
@@ -1077,7 +1077,7 @@ func (h *CompatHandler) menuCustomizationsFor(c *fiber.Ctx, menuItemID string) (
 		where = append(where, fmt.Sprintf("menu_item_id = $%d", len(args)))
 	}
 	q += " WHERE " + strings.Join(where, " AND ") + " ORDER BY name"
-	rows, err := h.pool.Query(c.Context(), q, args...)
+	rows, err := tenantPool(c, h.pool).Query(c.Context(), q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -1097,7 +1097,7 @@ func (h *CompatHandler) menuCustomizationsFor(c *fiber.Ctx, menuItemID string) (
 }
 
 func (h *CompatHandler) selectInventoryItems(c *fiber.Ctx, filters []compatFilter) error {
-	rows, err := h.pool.Query(c.Context(), `SELECT id, name, unit, current_stock, min_stock, cost_per_unit, is_perishable, expiry_date, supplier, created_at, updated_at FROM inventory_items WHERE hotel_id = $1 ORDER BY name`, h.hotelID(c))
+	rows, err := tenantPool(c, h.pool).Query(c.Context(), `SELECT id, name, unit, current_stock, min_stock, cost_per_unit, is_perishable, expiry_date, supplier, created_at, updated_at FROM inventory_items WHERE hotel_id = $1 ORDER BY name`, h.hotelID(c))
 	if err != nil {
 		return response.Error(c, fiber.StatusInternalServerError, err.Error())
 	}
@@ -1126,7 +1126,7 @@ func (h *CompatHandler) selectGuestPreferences(c *fiber.Ctx, filters []compatFil
 		where = append(where, fmt.Sprintf("user_id = $%d", len(args)))
 	}
 	q += " WHERE " + strings.Join(where, " AND ") + " ORDER BY created_at DESC"
-	rows, err := h.pool.Query(c.Context(), q, args...)
+	rows, err := tenantPool(c, h.pool).Query(c.Context(), q, args...)
 	if err != nil {
 		return response.Error(c, fiber.StatusInternalServerError, err.Error())
 	}
@@ -1156,7 +1156,7 @@ func (h *CompatHandler) selectGuestPreferences(c *fiber.Ctx, filters []compatFil
 func (h *CompatHandler) insertComplaint(c *fiber.Ctx, v map[string]interface{}) error {
 	id := uuid.New().String()
 	number := asStringDefault(v["complaint_number"], fmt.Sprintf("C-%s", id[:6]))
-	_, err := h.pool.Exec(c.Context(), `INSERT INTO complaints (id, hotel_id, complaint_number, guest_stay_id, guest_id, category, priority, status, description, resolution, resolved_by, resolved_at, guest_feedback, created_by, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,now(),now())`, id, h.hotelID(c), number, nullableString(v["guest_stay_id"]), nullableString(v["guest_id"]), asStringDefault(v["category"], "Other"), asStringDefault(v["priority"], "medium"), asStringDefault(v["status"], "open"), asString(v["description"]), nullableString(v["resolution"]), nullableString(v["resolved_by"]), v["resolved_at"], nullableString(v["guest_feedback"]), nullableString(v["created_by"]))
+	_, err := tenantPool(c, h.pool).Exec(c.Context(), `INSERT INTO complaints (id, hotel_id, complaint_number, guest_stay_id, guest_id, category, priority, status, description, resolution, resolved_by, resolved_at, guest_feedback, created_by, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,now(),now())`, id, h.hotelID(c), number, nullableString(v["guest_stay_id"]), nullableString(v["guest_id"]), asStringDefault(v["category"], "Other"), asStringDefault(v["priority"], "medium"), asStringDefault(v["status"], "open"), asString(v["description"]), nullableString(v["resolution"]), nullableString(v["resolved_by"]), v["resolved_at"], nullableString(v["guest_feedback"]), nullableString(v["created_by"]))
 	if err != nil {
 		return response.Error(c, fiber.StatusBadRequest, err.Error())
 	}
@@ -1169,7 +1169,7 @@ func (h *CompatHandler) insertMenuCategory(c *fiber.Ctx, v map[string]interface{
 		return response.Error(c, fiber.StatusBadRequest, "name is required")
 	}
 	id := uuid.New().String()
-	_, err := h.pool.Exec(c.Context(), `INSERT INTO menu_categories (id, hotel_id, name, description, display_order, is_active, created_at) VALUES ($1,$2,$3,$4,$5,$6,now())`, id, h.hotelID(c), name, nullableString(v["description"]), asIntDefault(v["display_order"], 0), asBoolDefault(v["is_active"], true))
+	_, err := tenantPool(c, h.pool).Exec(c.Context(), `INSERT INTO menu_categories (id, hotel_id, name, description, display_order, is_active, created_at) VALUES ($1,$2,$3,$4,$5,$6,now())`, id, h.hotelID(c), name, nullableString(v["description"]), asIntDefault(v["display_order"], 0), asBoolDefault(v["is_active"], true))
 	if err != nil {
 		return response.Error(c, fiber.StatusBadRequest, err.Error())
 	}
@@ -1184,7 +1184,7 @@ func (h *CompatHandler) insertMenuItem(c *fiber.Ctx, v map[string]interface{}, s
 		return response.Error(c, fiber.StatusBadRequest, "price cannot be negative")
 	}
 	id := uuid.New().String()
-	rows, err := h.pool.Query(c.Context(), `INSERT INTO menu_items (id, hotel_id, category_id, name, description, price, image_url, is_available, preparation_time, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,now(),now()) RETURNING id, category_id, name, description, price, image_url, is_available, preparation_time, created_at, updated_at`, id, h.hotelID(c), nullableString(v["category_id"]), asString(v["name"]), nullableString(v["description"]), asFloatDefault(v["price"], 0), nullableString(v["image_url"]), asBoolDefault(v["is_available"], true), asIntDefault(v["preparation_time"], 15))
+	rows, err := tenantPool(c, h.pool).Query(c.Context(), `INSERT INTO menu_items (id, hotel_id, category_id, name, description, price, image_url, is_available, preparation_time, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,now(),now()) RETURNING id, category_id, name, description, price, image_url, is_available, preparation_time, created_at, updated_at`, id, h.hotelID(c), nullableString(v["category_id"]), asString(v["name"]), nullableString(v["description"]), asFloatDefault(v["price"], 0), nullableString(v["image_url"]), asBoolDefault(v["is_available"], true), asIntDefault(v["preparation_time"], 15))
 	if err != nil {
 		return response.Error(c, fiber.StatusBadRequest, err.Error())
 	}
@@ -1201,7 +1201,7 @@ func (h *CompatHandler) insertMenuItem(c *fiber.Ctx, v map[string]interface{}, s
 
 func (h *CompatHandler) insertMenuCustomization(c *fiber.Ctx, v map[string]interface{}) error {
 	id := uuid.New().String()
-	_, err := h.pool.Exec(c.Context(), `INSERT INTO menu_item_customizations (id, hotel_id, menu_item_id, name, price, is_available, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,now(),now())`, id, h.hotelID(c), asString(v["menu_item_id"]), asString(v["name"]), asFloatDefault(v["price"], 0), asBoolDefault(v["is_available"], true))
+	_, err := tenantPool(c, h.pool).Exec(c.Context(), `INSERT INTO menu_item_customizations (id, hotel_id, menu_item_id, name, price, is_available, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,now(),now())`, id, h.hotelID(c), asString(v["menu_item_id"]), asString(v["name"]), asFloatDefault(v["price"], 0), asBoolDefault(v["is_available"], true))
 	if err != nil {
 		return response.Error(c, fiber.StatusBadRequest, err.Error())
 	}
@@ -1212,7 +1212,7 @@ func (h *CompatHandler) insertMenuCustomizations(c *fiber.Ctx, values []map[stri
 	items := make([]map[string]interface{}, 0, len(values))
 	for _, v := range values {
 		id := uuid.New().String()
-		_, err := h.pool.Exec(c.Context(), `INSERT INTO menu_item_customizations (id, hotel_id, menu_item_id, name, price, is_available, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,now(),now())`, id, h.hotelID(c), asString(v["menu_item_id"]), asString(v["name"]), asFloatDefault(v["price"], 0), asBoolDefault(v["is_available"], true))
+		_, err := tenantPool(c, h.pool).Exec(c.Context(), `INSERT INTO menu_item_customizations (id, hotel_id, menu_item_id, name, price, is_available, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,now(),now())`, id, h.hotelID(c), asString(v["menu_item_id"]), asString(v["name"]), asFloatDefault(v["price"], 0), asBoolDefault(v["is_available"], true))
 		if err != nil {
 			return response.Error(c, fiber.StatusBadRequest, err.Error())
 		}
@@ -1223,7 +1223,7 @@ func (h *CompatHandler) insertMenuCustomizations(c *fiber.Ctx, values []map[stri
 
 func (h *CompatHandler) insertInventoryItem(c *fiber.Ctx, v map[string]interface{}) error {
 	id := uuid.New().String()
-	_, err := h.pool.Exec(c.Context(), `INSERT INTO inventory_items (id, hotel_id, name, unit, current_stock, min_stock, cost_per_unit, is_perishable, expiry_date, supplier, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,now(),now())`, id, h.hotelID(c), asString(v["name"]), asStringDefault(v["unit"], "unit"), asFloatDefault(v["current_stock"], 0), asFloatDefault(v["min_stock"], 0), nullableFloat(v["cost_per_unit"]), asBoolDefault(v["is_perishable"], false), v["expiry_date"], nullableString(v["supplier"]))
+	_, err := tenantPool(c, h.pool).Exec(c.Context(), `INSERT INTO inventory_items (id, hotel_id, name, unit, current_stock, min_stock, cost_per_unit, is_perishable, expiry_date, supplier, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,now(),now())`, id, h.hotelID(c), asString(v["name"]), asStringDefault(v["unit"], "unit"), asFloatDefault(v["current_stock"], 0), asFloatDefault(v["min_stock"], 0), nullableFloat(v["cost_per_unit"]), asBoolDefault(v["is_perishable"], false), v["expiry_date"], nullableString(v["supplier"]))
 	if err != nil {
 		return response.Error(c, fiber.StatusBadRequest, err.Error())
 	}
@@ -1233,7 +1233,7 @@ func (h *CompatHandler) insertInventoryItem(c *fiber.Ctx, v map[string]interface
 func (h *CompatHandler) insertGuestPreferences(c *fiber.Ctx, v map[string]interface{}, single string) error {
 	id := uuid.New().String()
 	notes := mergePreferenceNotes(nullableString(v["notes"]), asStringDefault(v["country"], "United States"), asStringDefault(v["currency"], "USD"))
-	rows, err := h.pool.Query(c.Context(), `INSERT INTO guest_preferences (id, hotel_id, user_id, dietary_restrictions, allergies, favorite_categories, notes, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,now(),now()) ON CONFLICT (user_id) DO UPDATE SET dietary_restrictions = EXCLUDED.dietary_restrictions, allergies = EXCLUDED.allergies, favorite_categories = EXCLUDED.favorite_categories, notes = EXCLUDED.notes, updated_at = now() RETURNING id, user_id, dietary_restrictions, allergies, favorite_categories, notes, created_at, updated_at`,
+	rows, err := tenantPool(c, h.pool).Query(c.Context(), `INSERT INTO guest_preferences (id, hotel_id, user_id, dietary_restrictions, allergies, favorite_categories, notes, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,now(),now()) ON CONFLICT (user_id) DO UPDATE SET dietary_restrictions = EXCLUDED.dietary_restrictions, allergies = EXCLUDED.allergies, favorite_categories = EXCLUDED.favorite_categories, notes = EXCLUDED.notes, updated_at = now() RETURNING id, user_id, dietary_restrictions, allergies, favorite_categories, notes, created_at, updated_at`,
 		id, h.hotelID(c), asString(v["user_id"]), asStringSlice(v["dietary_restrictions"]), asStringSlice(v["allergies"]), asStringSlice(v["favorite_categories"]), notes)
 	if err != nil {
 		return response.Error(c, fiber.StatusBadRequest, err.Error())
@@ -1309,7 +1309,7 @@ func (h *CompatHandler) selectOrders(c *fiber.Ctx, filters []compatFilter) error
 		q += " WHERE " + strings.Join(where, " AND ")
 	}
 	q += " ORDER BY o.created_at DESC"
-	rows, err := h.pool.Query(c.Context(), q, args...)
+	rows, err := tenantPool(c, h.pool).Query(c.Context(), q, args...)
 	if err != nil {
 		return response.Error(c, fiber.StatusInternalServerError, err.Error())
 	}
@@ -1364,7 +1364,7 @@ func (h *CompatHandler) orderItemsFor(c *fiber.Ctx, orderID string) ([]map[strin
 		where = append(where, fmt.Sprintf("oi.order_id = $%d", len(args)))
 	}
 	q += " WHERE " + strings.Join(where, " AND ") + " ORDER BY oi.created_at"
-	rows, err := h.pool.Query(c.Context(), q, args...)
+	rows, err := tenantPool(c, h.pool).Query(c.Context(), q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -1409,7 +1409,7 @@ func (h *CompatHandler) selectPayments(c *fiber.Ctx, filters []compatFilter) err
 		q += " WHERE " + strings.Join(where, " AND ")
 	}
 	q += " ORDER BY p.created_at DESC"
-	rows, err := h.pool.Query(c.Context(), q, args...)
+	rows, err := tenantPool(c, h.pool).Query(c.Context(), q, args...)
 	if err != nil {
 		return response.Error(c, fiber.StatusInternalServerError, err.Error())
 	}
@@ -1441,7 +1441,7 @@ func (h *CompatHandler) selectPayments(c *fiber.Ctx, filters []compatFilter) err
 }
 
 func (h *CompatHandler) selectPaymentSettings(c *fiber.Ctx, filters []compatFilter) error {
-	rows, err := h.pool.Query(c.Context(), `SELECT id, gateway_name, webhook_url, is_active, created_by, created_at, updated_at FROM payment_settings WHERE hotel_id = $1 ORDER BY gateway_name`, h.hotelID(c))
+	rows, err := tenantPool(c, h.pool).Query(c.Context(), `SELECT id, gateway_name, webhook_url, is_active, created_by, created_at, updated_at FROM payment_settings WHERE hotel_id = $1 ORDER BY gateway_name`, h.hotelID(c))
 	if err != nil {
 		return response.Error(c, fiber.StatusInternalServerError, err.Error())
 	}
@@ -1469,7 +1469,7 @@ func (h *CompatHandler) selectStaffShifts(c *fiber.Ctx, filters []compatFilter) 
 		where = append(where, fmt.Sprintf("ss.user_id = $%d", len(args)))
 	}
 	q += " WHERE " + strings.Join(where, " AND ") + " ORDER BY ss.clock_in DESC"
-	rows, err := h.pool.Query(c.Context(), q, args...)
+	rows, err := tenantPool(c, h.pool).Query(c.Context(), q, args...)
 	if err != nil {
 		return response.Error(c, fiber.StatusInternalServerError, err.Error())
 	}
@@ -1509,7 +1509,7 @@ func (h *CompatHandler) selectHousekeepingAssignments(c *fiber.Ctx, filters []co
 		q += " WHERE " + strings.Join(where, " AND ")
 	}
 	q += " ORDER BY ha.created_at DESC"
-	rows, err := h.pool.Query(c.Context(), q, args...)
+	rows, err := tenantPool(c, h.pool).Query(c.Context(), q, args...)
 	if err != nil {
 		return response.Error(c, fiber.StatusInternalServerError, err.Error())
 	}
@@ -1556,7 +1556,7 @@ func (h *CompatHandler) selectWorkOrders(c *fiber.Ctx, filters []compatFilter) e
 		q += " WHERE " + strings.Join(where, " AND ")
 	}
 	q += " ORDER BY CASE wo.priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END, wo.created_at DESC"
-	rows, err := h.pool.Query(c.Context(), q, args...)
+	rows, err := tenantPool(c, h.pool).Query(c.Context(), q, args...)
 	if err != nil {
 		return response.Error(c, fiber.StatusInternalServerError, err.Error())
 	}
@@ -1592,7 +1592,7 @@ func (h *CompatHandler) selectFolios(c *fiber.Ctx, filters []compatFilter) error
 		q += " WHERE " + strings.Join(where, " AND ")
 	}
 	q += " ORDER BY created_at DESC"
-	rows, err := h.pool.Query(c.Context(), q, args...)
+	rows, err := tenantPool(c, h.pool).Query(c.Context(), q, args...)
 	if err != nil {
 		return response.Error(c, fiber.StatusInternalServerError, err.Error())
 	}
@@ -1617,7 +1617,7 @@ func (h *CompatHandler) selectFolioCharges(c *fiber.Ctx, filters []compatFilter)
 		where = append(where, fmt.Sprintf("folio_id = $%d", len(args)))
 	}
 	q += " WHERE " + strings.Join(where, " AND ") + " ORDER BY posted_at DESC"
-	rows, err := h.pool.Query(c.Context(), q, args...)
+	rows, err := tenantPool(c, h.pool).Query(c.Context(), q, args...)
 	if err != nil {
 		return response.Error(c, fiber.StatusInternalServerError, err.Error())
 	}
@@ -1637,7 +1637,7 @@ func (h *CompatHandler) selectFolioCharges(c *fiber.Ctx, filters []compatFilter)
 }
 
 func (h *CompatHandler) selectAuditLogs(c *fiber.Ctx, filters []compatFilter) error {
-	rows, err := h.pool.Query(c.Context(), `SELECT id, user_id, action, table_name, record_id, old_data, new_data, created_at FROM audit_logs WHERE hotel_id = $1 ORDER BY created_at DESC`, h.hotelID(c))
+	rows, err := tenantPool(c, h.pool).Query(c.Context(), `SELECT id, user_id, action, table_name, record_id, old_data, new_data, created_at FROM audit_logs WHERE hotel_id = $1 ORDER BY created_at DESC`, h.hotelID(c))
 	if err != nil {
 		return response.Error(c, fiber.StatusInternalServerError, err.Error())
 	}
@@ -1659,7 +1659,7 @@ func (h *CompatHandler) selectAuditLogs(c *fiber.Ctx, filters []compatFilter) er
 func (h *CompatHandler) insertOrder(c *fiber.Ctx, v map[string]interface{}, single string) error {
 	id := uuid.New().String()
 	number := asStringDefault(v["order_number"], fmt.Sprintf("ORD-%s", id[:8]))
-	rows, err := h.pool.Query(c.Context(), `INSERT INTO orders (id, hotel_id, order_number, guest_stay_id, room_id, guest_id, status, special_instructions, total_amount, assigned_waiter_id, created_by, kitchen_notes, pickup_time, delivery_time, rating, feedback, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,now(),now()) RETURNING id, order_number, guest_stay_id, room_id, guest_id, status, special_instructions, total_amount, assigned_waiter_id, created_by, kitchen_notes, pickup_time, delivery_time, rating, feedback, created_at, updated_at`,
+	rows, err := tenantPool(c, h.pool).Query(c.Context(), `INSERT INTO orders (id, hotel_id, order_number, guest_stay_id, room_id, guest_id, status, special_instructions, total_amount, assigned_waiter_id, created_by, kitchen_notes, pickup_time, delivery_time, rating, feedback, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,now(),now()) RETURNING id, order_number, guest_stay_id, room_id, guest_id, status, special_instructions, total_amount, assigned_waiter_id, created_by, kitchen_notes, pickup_time, delivery_time, rating, feedback, created_at, updated_at`,
 		id, h.hotelID(c), number, nullableString(v["guest_stay_id"]), nullableString(v["room_id"]), nullableString(v["guest_id"]), asStringDefault(v["status"], "pending"), nullableString(v["special_instructions"]), asFloatDefault(v["total_amount"], 0), nullableString(v["assigned_waiter_id"]), nullableString(v["created_by"]), nullableString(v["kitchen_notes"]), v["pickup_time"], v["delivery_time"], nullableInt(v["rating"]), nullableString(v["feedback"]))
 	if err != nil {
 		return response.Error(c, fiber.StatusBadRequest, err.Error())
@@ -1679,7 +1679,7 @@ func (h *CompatHandler) insertOrderItems(c *fiber.Ctx, values []map[string]inter
 	items := make([]map[string]interface{}, 0, len(values))
 	for _, v := range values {
 		id := uuid.New().String()
-		_, err := h.pool.Exec(c.Context(), `INSERT INTO order_items (id, hotel_id, order_id, menu_item_id, quantity, unit_price, notes, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,now())`, id, h.hotelID(c), asString(v["order_id"]), asString(v["menu_item_id"]), asIntDefault(v["quantity"], 1), asFloatDefault(v["unit_price"], 0), nullableString(v["notes"]))
+		_, err := tenantPool(c, h.pool).Exec(c.Context(), `INSERT INTO order_items (id, hotel_id, order_id, menu_item_id, quantity, unit_price, notes, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,now())`, id, h.hotelID(c), asString(v["order_id"]), asString(v["menu_item_id"]), asIntDefault(v["quantity"], 1), asFloatDefault(v["unit_price"], 0), nullableString(v["notes"]))
 		if err != nil {
 			return response.Error(c, fiber.StatusBadRequest, err.Error())
 		}
@@ -1691,7 +1691,7 @@ func (h *CompatHandler) insertOrderItems(c *fiber.Ctx, values []map[string]inter
 func (h *CompatHandler) insertPayment(c *fiber.Ctx, v map[string]interface{}) error {
 	id := uuid.New().String()
 	number := asStringDefault(v["payment_number"], fmt.Sprintf("PAY-%s", id[:8]))
-	_, err := h.pool.Exec(c.Context(), `INSERT INTO payments (id, hotel_id, payment_number, guest_stay_id, order_id, amount, payment_method, status, processed_by, notes, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,now())`, id, h.hotelID(c), number, nullableString(v["guest_stay_id"]), nullableString(v["order_id"]), asFloatDefault(v["amount"], 0), asStringDefault(v["payment_method"], "cash"), asStringDefault(v["status"], "pending"), nullableString(v["processed_by"]), nullableString(v["notes"]))
+	_, err := tenantPool(c, h.pool).Exec(c.Context(), `INSERT INTO payments (id, hotel_id, payment_number, guest_stay_id, order_id, amount, payment_method, status, processed_by, notes, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,now())`, id, h.hotelID(c), number, nullableString(v["guest_stay_id"]), nullableString(v["order_id"]), asFloatDefault(v["amount"], 0), asStringDefault(v["payment_method"], "cash"), asStringDefault(v["status"], "pending"), nullableString(v["processed_by"]), nullableString(v["notes"]))
 	if err != nil {
 		return response.Error(c, fiber.StatusBadRequest, err.Error())
 	}
@@ -1700,7 +1700,7 @@ func (h *CompatHandler) insertPayment(c *fiber.Ctx, v map[string]interface{}) er
 
 func (h *CompatHandler) insertPaymentSetting(c *fiber.Ctx, v map[string]interface{}) error {
 	id := uuid.New().String()
-	_, err := h.pool.Exec(c.Context(), `INSERT INTO payment_settings (id, hotel_id, gateway_name, webhook_url, is_active, created_by, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,now(),now()) ON CONFLICT (gateway_name) DO UPDATE SET webhook_url = EXCLUDED.webhook_url, is_active = EXCLUDED.is_active, updated_at = now()`, id, h.hotelID(c), asString(v["gateway_name"]), nullableString(v["webhook_url"]), asBoolDefault(v["is_active"], true), nullableString(v["created_by"]))
+	_, err := tenantPool(c, h.pool).Exec(c.Context(), `INSERT INTO payment_settings (id, hotel_id, gateway_name, webhook_url, is_active, created_by, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,now(),now()) ON CONFLICT (gateway_name) DO UPDATE SET webhook_url = EXCLUDED.webhook_url, is_active = EXCLUDED.is_active, updated_at = now()`, id, h.hotelID(c), asString(v["gateway_name"]), nullableString(v["webhook_url"]), asBoolDefault(v["is_active"], true), nullableString(v["created_by"]))
 	if err != nil {
 		return response.Error(c, fiber.StatusBadRequest, err.Error())
 	}
@@ -1713,7 +1713,7 @@ func (h *CompatHandler) insertStaffShift(c *fiber.Ctx, v map[string]interface{})
 	if clockIn == nil {
 		clockIn = "now()"
 	}
-	_, err := h.pool.Exec(c.Context(), `INSERT INTO staff_shifts (id, hotel_id, user_id, clock_in, clock_out, notes, created_at) VALUES ($1,$2,$3,$4,$5,$6,now())`, id, h.hotelID(c), asString(v["user_id"]), clockIn, v["clock_out"], nullableString(v["notes"]))
+	_, err := tenantPool(c, h.pool).Exec(c.Context(), `INSERT INTO staff_shifts (id, hotel_id, user_id, clock_in, clock_out, notes, created_at) VALUES ($1,$2,$3,$4,$5,$6,now())`, id, h.hotelID(c), asString(v["user_id"]), clockIn, v["clock_out"], nullableString(v["notes"]))
 	if err != nil {
 		return response.Error(c, fiber.StatusBadRequest, err.Error())
 	}
@@ -1722,7 +1722,7 @@ func (h *CompatHandler) insertStaffShift(c *fiber.Ctx, v map[string]interface{})
 
 func (h *CompatHandler) insertHousekeepingAssignment(c *fiber.Ctx, v map[string]interface{}) error {
 	id := uuid.New().String()
-	_, err := h.pool.Exec(c.Context(), `INSERT INTO housekeeping_assignments (id, hotel_id, room_id, assigned_to, task_type, priority, status, notes, started_at, completed_at, inspected_by, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,now(),now())`,
+	_, err := tenantPool(c, h.pool).Exec(c.Context(), `INSERT INTO housekeeping_assignments (id, hotel_id, room_id, assigned_to, task_type, priority, status, notes, started_at, completed_at, inspected_by, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,now(),now())`,
 		id, h.hotelID(c), asString(v["room_id"]), nullableString(v["assigned_to"]), asStringDefault(v["task_type"], "guest_request"), asStringDefault(v["priority"], "normal"), asStringDefault(v["status"], "pending"), nullableString(v["notes"]), v["started_at"], v["completed_at"], nullableString(v["inspected_by"]))
 	if err != nil {
 		return response.Error(c, fiber.StatusBadRequest, err.Error())
@@ -1732,7 +1732,7 @@ func (h *CompatHandler) insertHousekeepingAssignment(c *fiber.Ctx, v map[string]
 
 func (h *CompatHandler) insertWorkOrder(c *fiber.Ctx, v map[string]interface{}) error {
 	id := uuid.New().String()
-	_, err := h.pool.Exec(c.Context(), `INSERT INTO work_orders (id, hotel_id, room_id, reported_by, assigned_to, category, priority, status, title, description, resolution_notes, estimated_minutes, actual_minutes, created_at, updated_at, resolved_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,now(),now(),$14)`,
+	_, err := tenantPool(c, h.pool).Exec(c.Context(), `INSERT INTO work_orders (id, hotel_id, room_id, reported_by, assigned_to, category, priority, status, title, description, resolution_notes, estimated_minutes, actual_minutes, created_at, updated_at, resolved_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,now(),now(),$14)`,
 		id, h.hotelID(c), nullableString(v["room_id"]), asString(v["reported_by"]), nullableString(v["assigned_to"]), nullableString(v["category"]), asStringDefault(v["priority"], "normal"), asStringDefault(v["status"], "open"), asString(v["title"]), nullableString(v["description"]), nullableString(v["resolution_notes"]), nullableInt(v["estimated_minutes"]), nullableInt(v["actual_minutes"]), v["resolved_at"])
 	if err != nil {
 		return response.Error(c, fiber.StatusBadRequest, err.Error())
@@ -1777,7 +1777,7 @@ func (h *CompatHandler) deleteByIDOrColumn(c *fiber.Ctx, table, id string, filte
 			args = append(args, h.hotelID(c))
 			q += " AND hotel_id = $2"
 		}
-		if _, err := h.pool.Exec(c.Context(), q, args...); err != nil {
+		if _, err := tenantPool(c, h.pool).Exec(c.Context(), q, args...); err != nil {
 			return response.Error(c, fiber.StatusBadRequest, err.Error())
 		}
 		return response.OK(c, []map[string]interface{}{})
@@ -1792,7 +1792,7 @@ func (h *CompatHandler) deleteByIDOrColumn(c *fiber.Ctx, table, id string, filte
 		args = append(args, h.hotelID(c))
 		q += " AND hotel_id = $2"
 	}
-	if _, err := h.pool.Exec(c.Context(), q, args...); err != nil {
+	if _, err := tenantPool(c, h.pool).Exec(c.Context(), q, args...); err != nil {
 		return response.Error(c, fiber.StatusBadRequest, err.Error())
 	}
 	return response.OK(c, []map[string]interface{}{})
@@ -1904,7 +1904,7 @@ func (h *CompatHandler) updateAllowedByColumnWithTimestamp(c *fiber.Ctx, table, 
 		args = append(args, h.hotelID(c))
 		q += fmt.Sprintf(" AND hotel_id = $%d", len(args))
 	}
-	if _, err := h.pool.Exec(c.Context(), q, args...); err != nil {
+	if _, err := tenantPool(c, h.pool).Exec(c.Context(), q, args...); err != nil {
 		return response.Error(c, fiber.StatusBadRequest, err.Error())
 	}
 	return response.OK(c, []map[string]interface{}{})

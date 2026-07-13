@@ -1,0 +1,50 @@
+name: CI
+
+# Backend gates that were previously only run by hand before a deploy (fix
+# checklist §2). Runs on every push/PR so a broken build, vet failure, unformatted
+# file, or a migration with a ';' inside a '--' comment (which crash-loops the API
+# on boot) can never reach the VM unnoticed.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # gofmt is reported but NOT a hard gate yet: many existing files carry a
+      # UTF-8 BOM (from Windows editors) that gofmt wants to strip, so a hard
+      # `gofmt -l` fail would red-X every build until a separate repo-wide BOM
+      # cleanup lands. Listed here so drift is visible; build/vet/migration-lint
+      # below are the enforcing gates. Flip `continue-on-error` off after the BOM
+      # sweep to make formatting mandatory.
+      - name: gofmt (report only — see note)
+        continue-on-error: true
+        run: |
+          unformatted="$(gofmt -l $(git ls-files '*.go'))"
+          if [ -n "$unformatted" ]; then
+            echo "::warning:: these files are not gofmt-clean (likely UTF-8 BOM):"
+            echo "$unformatted"
+          else
+            echo "gofmt OK"
+          fi
+
+      - name: go build
+        run: go build ./...
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: migration lint (no ';' inside '--' comments)
+        run: bash scripts/check_migrations.sh
+
+      - name: go test
+        run: go test ./...

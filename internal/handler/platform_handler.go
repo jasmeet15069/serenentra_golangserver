@@ -801,9 +801,13 @@ func (h *OperationsHandler) UpdatePlatformTenant(c *fiber.Ctx) error {
 // dedicated database so handlers can resolve the hotel and its settings
 // without querying the shared pool. Users/auth records are intentionally
 // NOT seeded here — they remain in the shared DB for auth routing.
-// Also seeds 10 default rooms, 5 menu categories, 3 payment methods,
-// a default restaurant outlet (pro/premium), and an initial config snapshot
-// so the client portal is fully populated on first login.
+//
+// It seeds ONLY the hotel record, branding, payment config, and an initial
+// tenant_configs snapshot. It deliberately seeds NO operational content —
+// every new client starts completely blank (zero rooms, menu categories,
+// payment methods, and outlets) and builds their own from the portal. The
+// earlier template-seeding of 10 rooms / 5 menu categories / etc. was reversed
+// on 2026-07-02; the blank-slate default is intentional (see the body below).
 func seedTenantDB(ctx context.Context, pool *pgxpool.Pool, hotelID uuid.UUID, name, slug, plan, currency, country, settings string) error {
 	primaryColor, clientColor, adminColor := planBrandColors(plan)
 

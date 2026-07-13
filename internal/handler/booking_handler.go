@@ -1,7 +1,8 @@
-﻿package handler
+package handler
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -35,6 +36,10 @@ func (h *BookingHandler) Register(r fiber.Router) {
 	r.Delete("/booking/promotions/:id", h.DeletePromotion)
 	r.Patch("/booking/promotions/:id", h.TogglePromotion)
 	r.Post("/booking/validate-promo", h.ValidatePromo)
+	r.Get("/booking/rate-plans", h.ListRatePlans)
+	r.Post("/booking/rate-plans", h.CreateRatePlan)
+	r.Patch("/booking/rate-plans/:id", h.UpdateRatePlan)
+	r.Delete("/booking/rate-plans/:id", h.DeleteRatePlan)
 }
 
 // ---------------------------------------------------------------------------
@@ -407,4 +412,169 @@ func (h *BookingHandler) TogglePromotion(c *fiber.Ctx) error {
 		return response.Error(c, fiber.StatusNotFound, "promotion not found")
 	}
 	return response.OK(c, map[string]interface{}{"id": id, "active": *req.Active})
+}
+
+// ---------------------------------------------------------------------------
+// Rate plans (rate_plans table). A rate plan is a named pricing rule — e.g.
+// "Non-Refundable -10%" or "Long Stay 7+ nights" — with an optional discount and
+// a minimum-stay requirement. Parallels promotions above; the booking module gate
+// at the router controls access. Uses tenantPool so a dedicated-DB tenant's plans
+// live in its own database.
+// ---------------------------------------------------------------------------
+
+type ratePlanResponse struct {
+	ID            uuid.UUID `json:"id"`
+	HotelID       uuid.UUID `json:"hotel_id"`
+	Name          string    `json:"name"`
+	Description   string    `json:"description"`
+	DiscountType  *string   `json:"discount_type"`
+	DiscountValue float64   `json:"discount_value"`
+	MinStayNights int       `json:"min_stay_nights"`
+	IsActive      bool      `json:"is_active"`
+	CreatedAt     time.Time `json:"created_at"`
+}
+
+type createRatePlanRequest struct {
+	Name          string  `json:"name"`
+	Description   string  `json:"description"`
+	DiscountType  string  `json:"discount_type"`
+	DiscountValue float64 `json:"discount_value"`
+	MinStayNights int     `json:"min_stay_nights"`
+}
+
+func (h *BookingHandler) ListRatePlans(c *fiber.Ctx) error {
+	rows, err := tenantPool(c, h.pool).Query(c.Context(), `
+		SELECT id, hotel_id, name, COALESCE(description,''), discount_type,
+		       COALESCE(discount_value,0), min_stay_nights, is_active, created_at
+		FROM rate_plans WHERE hotel_id = $1 ORDER BY created_at DESC`, tenantHotelID(c))
+	if err != nil {
+		return response.Error(c, fiber.StatusInternalServerError, err.Error())
+	}
+	defer rows.Close()
+	items := make([]ratePlanResponse, 0)
+	for rows.Next() {
+		var it ratePlanResponse
+		if err := rows.Scan(&it.ID, &it.HotelID, &it.Name, &it.Description, &it.DiscountType,
+			&it.DiscountValue, &it.MinStayNights, &it.IsActive, &it.CreatedAt); err != nil {
+			return response.Error(c, fiber.StatusInternalServerError, err.Error())
+		}
+		items = append(items, it)
+	}
+	return response.OK(c, items)
+}
+
+func (h *BookingHandler) CreateRatePlan(c *fiber.Ctx) error {
+	var req createRatePlanRequest
+	if err := c.BodyParser(&req); err != nil {
+		return response.Error(c, fiber.StatusBadRequest, "invalid request body")
+	}
+	if strings.TrimSpace(req.Name) == "" {
+		return response.Error(c, fiber.StatusBadRequest, "name is required")
+	}
+	if req.DiscountType != "" {
+		if req.DiscountType != "percentage" && req.DiscountType != "fixed" {
+			return response.Error(c, fiber.StatusBadRequest, "discount_type must be percentage or fixed")
+		}
+		if req.DiscountType == "percentage" && req.DiscountValue > 100 {
+			return response.Error(c, fiber.StatusBadRequest, "percentage discount cannot exceed 100")
+		}
+	}
+	if req.MinStayNights < 1 {
+		req.MinStayNights = 1
+	}
+	var discountType *string
+	if req.DiscountType != "" {
+		discountType = &req.DiscountType
+	}
+	id := uuid.New()
+	if _, err := tenantPool(c, h.pool).Exec(c.Context(), `
+		INSERT INTO rate_plans
+			(id, hotel_id, name, description, discount_type, discount_value, min_stay_nights, is_active, created_at, updated_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,true,now(),now())`,
+		id, tenantHotelID(c), strings.TrimSpace(req.Name), req.Description, discountType, req.DiscountValue, req.MinStayNights); err != nil {
+		return response.Error(c, fiber.StatusBadRequest, err.Error())
+	}
+	return response.Created(c, map[string]interface{}{"id": id, "name": strings.TrimSpace(req.Name)})
+}
+
+func (h *BookingHandler) UpdateRatePlan(c *fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return response.Error(c, fiber.StatusBadRequest, "invalid rate plan id")
+	}
+	var req struct {
+		Name          *string  `json:"name"`
+		Description   *string  `json:"description"`
+		DiscountType  *string  `json:"discount_type"`
+		DiscountValue *float64 `json:"discount_value"`
+		MinStayNights *int     `json:"min_stay_nights"`
+		IsActive      *bool    `json:"is_active"`
+	}
+	if err := c.BodyParser(&req); err != nil {
+		return response.Error(c, fiber.StatusBadRequest, "invalid request body")
+	}
+	// Build the SET list with the safe []string + strings.Join pattern so there is
+	// never a trailing-comma syntax error (see reference_update_handler_bug).
+	sets := []string{}
+	args := []interface{}{}
+	idx := 1
+	if req.Name != nil {
+		sets = append(sets, fmt.Sprintf("name = $%d", idx))
+		args = append(args, *req.Name)
+		idx++
+	}
+	if req.Description != nil {
+		sets = append(sets, fmt.Sprintf("description = $%d", idx))
+		args = append(args, *req.Description)
+		idx++
+	}
+	if req.DiscountType != nil {
+		sets = append(sets, fmt.Sprintf("discount_type = $%d", idx))
+		args = append(args, *req.DiscountType)
+		idx++
+	}
+	if req.DiscountValue != nil {
+		sets = append(sets, fmt.Sprintf("discount_value = $%d", idx))
+		args = append(args, *req.DiscountValue)
+		idx++
+	}
+	if req.MinStayNights != nil {
+		sets = append(sets, fmt.Sprintf("min_stay_nights = $%d", idx))
+		args = append(args, *req.MinStayNights)
+		idx++
+	}
+	if req.IsActive != nil {
+		sets = append(sets, fmt.Sprintf("is_active = $%d", idx))
+		args = append(args, *req.IsActive)
+		idx++
+	}
+	if len(sets) == 0 {
+		return response.Error(c, fiber.StatusBadRequest, "no fields to update")
+	}
+	sets = append(sets, "updated_at = now()")
+	args = append(args, id, tenantHotelID(c))
+	q := fmt.Sprintf("UPDATE rate_plans SET %s WHERE id = $%d AND hotel_id = $%d", strings.Join(sets, ", "), idx, idx+1)
+	tag, err := tenantPool(c, h.pool).Exec(c.Context(), q, args...)
+	if err != nil {
+		return response.Error(c, fiber.StatusBadRequest, err.Error())
+	}
+	if tag.RowsAffected() == 0 {
+		return response.Error(c, fiber.StatusNotFound, "rate plan not found")
+	}
+	return response.OK(c, map[string]interface{}{"id": id})
+}
+
+func (h *BookingHandler) DeleteRatePlan(c *fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return response.Error(c, fiber.StatusBadRequest, "invalid rate plan id")
+	}
+	tag, err := tenantPool(c, h.pool).Exec(c.Context(), `DELETE FROM rate_plans WHERE id = $1 AND hotel_id = $2`, id, tenantHotelID(c))
+	if err != nil {
+		return response.Error(c, fiber.StatusBadRequest, err.Error())
+	}
+	if tag.RowsAffected() == 0 {
+		return response.Error(c, fiber.StatusNotFound, "rate plan not found")
+	}
+	return response.OK(c, map[string]string{"status": "deleted"})
 }

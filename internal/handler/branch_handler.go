@@ -1,11 +1,13 @@
 package handler
 
 import (
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/hotelharmony/api/pkg/response"
 )
@@ -34,9 +36,20 @@ type createBranchRequest struct {
 	TotalRooms *int   `json:"total_rooms"`
 }
 
+// poolForHotel resolves the DB a given hotel's operational rows live in: the
+// tenant's dedicated pool when it is in dedicated isolation, else the shared pool.
+// Branches (properties) are operational data, so they must be read/written on this
+// pool — using the shared pool unconditionally lost a dedicated tenant's branches.
+func (h *OperationsHandler) poolForHotel(c *fiber.Ctx, hotelID uuid.UUID) *pgxpool.Pool {
+	if h.tenants != nil {
+		return h.tenants.PoolForHotel(c.Context(), hotelID)
+	}
+	return h.pool
+}
+
 // listBranchesFor returns every branch (property) belonging to a client.
-func (h *OperationsHandler) listBranchesFor(c *fiber.Ctx, hotelID uuid.UUID) error {
-	rows, err := h.pool.Query(c.Context(), `
+func (h *OperationsHandler) listBranchesFor(c *fiber.Ctx, pool *pgxpool.Pool, hotelID uuid.UUID) error {
+	rows, err := pool.Query(c.Context(), `
 		SELECT id, name, COALESCE(code,''), COALESCE(address,''), COALESCE(phone,''),
 		       COALESCE(email,''), COALESCE(timezone,'UTC'), COALESCE(currency,'USD'),
 		       COALESCE(is_active,true), COALESCE(is_primary,false),
@@ -75,7 +88,7 @@ func (h *OperationsHandler) listBranchesFor(c *fiber.Ctx, hotelID uuid.UUID) err
 
 // createBranchFor inserts a branch for a client, enforcing the plan's
 // max_properties ceiling. The first branch of a client is marked primary.
-func (h *OperationsHandler) createBranchFor(c *fiber.Ctx, hotelID uuid.UUID) error {
+func (h *OperationsHandler) createBranchFor(c *fiber.Ctx, pool *pgxpool.Pool, hotelID uuid.UUID) error {
 	var req createBranchRequest
 	if err := c.BodyParser(&req); err != nil {
 		return response.Error(c, fiber.StatusBadRequest, "invalid request body")
@@ -85,10 +98,12 @@ func (h *OperationsHandler) createBranchFor(c *fiber.Ctx, hotelID uuid.UUID) err
 		return response.Error(c, fiber.StatusUnprocessableEntity, "branch name is required")
 	}
 
-	// Enforce plan max_properties.
+	// Enforce plan max_properties. Both the hotel row and the properties count are
+	// read on the tenant's own pool (the hotel row is seeded into a dedicated DB at
+	// provision), so the count reflects the branches that actually exist there.
 	var plan string
 	var existing int
-	if err := h.pool.QueryRow(c.Context(),
+	if err := pool.QueryRow(c.Context(),
 		`SELECT h.plan_tier, (SELECT COUNT(*) FROM properties p WHERE p.hotel_id = h.id)
 		 FROM hotels h WHERE h.id = $1`, hotelID).Scan(&plan, &existing); err != nil {
 		return response.Error(c, fiber.StatusNotFound, "client not found")
@@ -109,7 +124,7 @@ func (h *OperationsHandler) createBranchFor(c *fiber.Ctx, hotelID uuid.UUID) err
 	isPrimary := existing == 0
 	branchID := uuid.New()
 
-	if _, err := h.pool.Exec(c.Context(), `
+	if _, err := pool.Exec(c.Context(), `
 		INSERT INTO properties (
 			id, hotel_id, name, code, address, phone, email, timezone, currency,
 			star_rating, total_rooms, is_active, is_primary, created_at, updated_at
@@ -131,18 +146,151 @@ func (h *OperationsHandler) createBranchFor(c *fiber.Ctx, hotelID uuid.UUID) err
 
 // --- Tenant self-service handlers (run behind authGate + plan gate) ---
 
+// hotelAdminRoles is the set of roles that count as "the hotel admin" across
+// tenants (the same admin role is named inconsistently: hotel_admin / admin /
+// super_admin). The Properties/branches feature is restricted to these — regular
+// staff (receptionist, cashier, housekeeping, waiter, food_manager) and the
+// platform operator (platform_admin, who uses the Platform* variants) are excluded.
+var hotelAdminRoles = []string{"hotel_admin", "admin", "super_admin"}
+
 func (h *OperationsHandler) ListBranches(c *fiber.Ctx) error {
-	if !requireAuthenticatedRequest(c, h.secretKey) {
+	if !requireAnyRoleFromToken(c, h.secretKey, hotelAdminRoles...) {
 		return nil
 	}
-	return h.listBranchesFor(c, h.currentHotelID(c))
+	return h.listBranchesFor(c, tenantPool(c, h.pool), h.currentHotelID(c))
 }
 
 func (h *OperationsHandler) CreateBranch(c *fiber.Ctx) error {
-	if !requireAnyRoleFromToken(c, h.secretKey, "admin", "hotel_admin", "super_admin", "platform_admin") {
+	if !requireAnyRoleFromToken(c, h.secretKey, hotelAdminRoles...) {
 		return nil
 	}
-	return h.createBranchFor(c, h.currentHotelID(c))
+	return h.createBranchFor(c, tenantPool(c, h.pool), h.currentHotelID(c))
+}
+
+// UpdateBranch (PATCH /api/branches/:id) edits a branch's fields. Hotel-admin only.
+func (h *OperationsHandler) UpdateBranch(c *fiber.Ctx) error {
+	if !requireAnyRoleFromToken(c, h.secretKey, hotelAdminRoles...) {
+		return nil
+	}
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return response.Error(c, fiber.StatusBadRequest, "invalid branch id")
+	}
+	var req struct {
+		Name       *string `json:"name"`
+		Code       *string `json:"code"`
+		Address    *string `json:"address"`
+		Phone      *string `json:"phone"`
+		Email      *string `json:"email"`
+		Timezone   *string `json:"timezone"`
+		Currency   *string `json:"currency"`
+		StarRating *int    `json:"star_rating"`
+		TotalRooms *int    `json:"total_rooms"`
+		IsActive   *bool   `json:"is_active"`
+	}
+	if err := c.BodyParser(&req); err != nil {
+		return response.Error(c, fiber.StatusBadRequest, "invalid request body")
+	}
+	// Safe []string + strings.Join SET builder (no trailing-comma bug).
+	sets := []string{}
+	args := []interface{}{}
+	idx := 1
+	add := func(col string, v interface{}) {
+		sets = append(sets, col+" = $"+strconv.Itoa(idx))
+		args = append(args, v)
+		idx++
+	}
+	if req.Name != nil {
+		if strings.TrimSpace(*req.Name) == "" {
+			return response.Error(c, fiber.StatusUnprocessableEntity, "branch name cannot be empty")
+		}
+		add("name", strings.TrimSpace(*req.Name))
+	}
+	if req.Code != nil {
+		add("code", nullableText(*req.Code))
+	}
+	if req.Address != nil {
+		add("address", nullableText(*req.Address))
+	}
+	if req.Phone != nil {
+		add("phone", nullableText(*req.Phone))
+	}
+	if req.Email != nil {
+		add("email", nullableText(*req.Email))
+	}
+	if req.Timezone != nil {
+		add("timezone", strings.TrimSpace(*req.Timezone))
+	}
+	if req.Currency != nil {
+		add("currency", strings.ToUpper(strings.TrimSpace(*req.Currency)))
+	}
+	if req.StarRating != nil {
+		add("star_rating", *req.StarRating)
+	}
+	if req.TotalRooms != nil {
+		add("total_rooms", *req.TotalRooms)
+	}
+	if req.IsActive != nil {
+		add("is_active", *req.IsActive)
+	}
+	if len(sets) == 0 {
+		return response.Error(c, fiber.StatusBadRequest, "no fields to update")
+	}
+	sets = append(sets, "updated_at = now()")
+	args = append(args, id, h.currentHotelID(c))
+	q := "UPDATE properties SET " + strings.Join(sets, ", ") +
+		" WHERE id = $" + strconv.Itoa(idx) + " AND hotel_id = $" + strconv.Itoa(idx+1)
+	tag, err := tenantPool(c, h.pool).Exec(c.Context(), q, args...)
+	if err != nil {
+		return response.Error(c, fiber.StatusBadRequest, err.Error())
+	}
+	if tag.RowsAffected() == 0 {
+		return response.Error(c, fiber.StatusNotFound, "branch not found")
+	}
+	return response.OK(c, map[string]interface{}{"id": id})
+}
+
+// DeleteBranch (DELETE /api/branches/:id) removes a branch. Hotel-admin only.
+// Rooms attached to it have their property_id set to NULL (schema FK). If the
+// deleted branch was the primary and other branches remain, the oldest remaining
+// one is promoted to primary so a client always has exactly one primary.
+func (h *OperationsHandler) DeleteBranch(c *fiber.Ctx) error {
+	if !requireAnyRoleFromToken(c, h.secretKey, hotelAdminRoles...) {
+		return nil
+	}
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return response.Error(c, fiber.StatusBadRequest, "invalid branch id")
+	}
+	hotelID := h.currentHotelID(c)
+	pool := tenantPool(c, h.pool)
+
+	tx, err := pool.Begin(c.Context())
+	if err != nil {
+		return response.Error(c, fiber.StatusInternalServerError, "failed to start transaction")
+	}
+	defer tx.Rollback(c.Context())
+
+	var wasPrimary bool
+	if err := tx.QueryRow(c.Context(),
+		`DELETE FROM properties WHERE id = $1 AND hotel_id = $2 RETURNING COALESCE(is_primary,false)`,
+		id, hotelID).Scan(&wasPrimary); err != nil {
+		return response.Error(c, fiber.StatusNotFound, "branch not found")
+	}
+	if wasPrimary {
+		// Promote the oldest remaining branch to primary, if any remain.
+		if _, err := tx.Exec(c.Context(), `
+			UPDATE properties SET is_primary = true, updated_at = now()
+			WHERE hotel_id = $1
+			  AND id = (SELECT id FROM properties WHERE hotel_id = $1 ORDER BY created_at ASC LIMIT 1)`,
+			hotelID); err != nil {
+			return response.Error(c, fiber.StatusInternalServerError, err.Error())
+		}
+	}
+	if err := tx.Commit(c.Context()); err != nil {
+		return response.Error(c, fiber.StatusInternalServerError, "failed to delete branch")
+	}
+	return response.OK(c, map[string]string{"status": "deleted"})
 }
 
 // BranchRooms (GET /api/branches/:id/rooms) is the reference branch-scoped read:
@@ -153,7 +301,7 @@ func (h *OperationsHandler) CreateBranch(c *fiber.Ctx) error {
 // via branchID(c). Rooms with a NULL property_id (not yet assigned to a branch)
 // are intentionally excluded from a specific-branch view.
 func (h *OperationsHandler) BranchRooms(c *fiber.Ctx) error {
-	if !requireAuthenticatedRequest(c, h.secretKey) {
+	if !requireAnyRoleFromToken(c, h.secretKey, hotelAdminRoles...) {
 		return nil
 	}
 	branch, err := uuid.Parse(c.Params("id"))
@@ -162,7 +310,7 @@ func (h *OperationsHandler) BranchRooms(c *fiber.Ctx) error {
 	}
 	hotelID := h.currentHotelID(c)
 
-	rows, err := h.pool.Query(c.Context(), `
+	rows, err := tenantPool(c, h.pool).Query(c.Context(), `
 		SELECT id, room_number, status, COALESCE(floor, 0)
 		FROM rooms
 		WHERE hotel_id = $1 AND property_id = $2
@@ -201,7 +349,7 @@ func (h *OperationsHandler) PlatformListBranches(c *fiber.Ctx) error {
 	if err != nil {
 		return response.Error(c, fiber.StatusBadRequest, "invalid tenant id")
 	}
-	return h.listBranchesFor(c, id)
+	return h.listBranchesFor(c, h.poolForHotel(c, id), id)
 }
 
 func (h *OperationsHandler) PlatformCreateBranch(c *fiber.Ctx) error {
@@ -212,5 +360,5 @@ func (h *OperationsHandler) PlatformCreateBranch(c *fiber.Ctx) error {
 	if err != nil {
 		return response.Error(c, fiber.StatusBadRequest, "invalid tenant id")
 	}
-	return h.createBranchFor(c, id)
+	return h.createBranchFor(c, h.poolForHotel(c, id), id)
 }

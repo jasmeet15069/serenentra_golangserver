@@ -28,7 +28,7 @@ func (d *DB) EnsureAppSchema(ctx context.Context) error {
 		)`,
 		`CREATE TABLE IF NOT EXISTS audit_logs (
 			id UUID PRIMARY KEY,
-			user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+			user_id UUID,
 			action TEXT NOT NULL,
 			table_name TEXT NOT NULL,
 			record_id UUID,
@@ -36,6 +36,19 @@ func (d *DB) EnsureAppSchema(ctx context.Context) error {
 			new_data JSONB,
 			created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
+		// Revenue categorization the dashboard queries depend on (see migration
+		// 023). Ensured here too so it lands even if the migration file isn't
+		// resolvable at runtime — the dashboard's category-filtered revenue
+		// queries silently return empty without it.
+		`ALTER TABLE payments ADD COLUMN IF NOT EXISTS category TEXT`,
+		// user_id has NO local FK: identity (users) always lives in the SHARED DB
+		// regardless of a tenant's isolation_mode, but audit_logs writes now go
+		// through tenantPool() like every other tenant-scoped table, so in a
+		// DEDICATED tenant's own DB the referenced user_id legitimately does not
+		// exist in that DB's (empty, schema-only) local users table. A hard FK
+		// there made every audit-logged write in a dedicated tenant fail. Drop it
+		// on any DB that still has it (idempotent — a no-op once already dropped).
+		`ALTER TABLE audit_logs DROP CONSTRAINT IF EXISTS audit_logs_user_id_fkey`,
 		`CREATE INDEX IF NOT EXISTS idx_order_items_order_id ON order_items(order_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_audit_logs_created ON audit_logs(created_at DESC)`,
 		`CREATE TABLE IF NOT EXISTS lost_items (
@@ -692,6 +705,44 @@ func (d *DB) EnsureAppSchema(ctx context.Context) error {
 		if _, err := d.Pool.Exec(ctx, statement); err != nil {
 			return fmt.Errorf("ensure schema: %w", err)
 		}
+	}
+	return nil
+}
+
+// EnsureDedicatedOverrides applies schema changes that are correct ONLY for a
+// dedicated per-tenant database — it MUST NOT be run against the shared primary
+// DB. In a dedicated DB the identity tables (users / profiles / user_roles) exist
+// but are always EMPTY: identity lives centrally in the shared DB regardless of a
+// tenant's isolation_mode. Every operational foreign key that points at those
+// tables (payments.processed_by, orders.created_by, complaints.created_by,
+// staff_shifts.user_id, work_orders.reported_by, and ~20 more) therefore can never
+// be satisfied in a dedicated DB, and any insert that supplies a real user id fails
+// with a 23503 FK violation. This surfaced once the compat layer was correctly
+// routed through the dedicated pool (previously those writes silently landed in the
+// shared DB, where the users existed). The audit_logs FK was the first symptom.
+//
+// Rather than hard-code the constraint names (fragile, and one omission reopens the
+// bug), drop every FK whose referenced table is an identity table, by catalog
+// lookup. Idempotent: once dropped the loop matches nothing. hotel_id → hotels FKs
+// are deliberately left intact — the tenant's own hotels row IS provisioned into
+// the dedicated DB, so those constraints are valid and worth keeping.
+func (d *DB) EnsureDedicatedOverrides(ctx context.Context) error {
+	const dropIdentityFKs = `
+DO $$
+DECLARE r RECORD;
+BEGIN
+  FOR r IN
+    SELECT con.conrelid::regclass::text AS tbl, con.conname AS name
+    FROM pg_constraint con
+    JOIN pg_class ref ON ref.oid = con.confrelid
+    WHERE con.contype = 'f'
+      AND ref.relname IN ('users', 'profiles', 'user_roles')
+  LOOP
+    EXECUTE format('ALTER TABLE %s DROP CONSTRAINT %I', r.tbl, r.name);
+  END LOOP;
+END $$;`
+	if _, err := d.Pool.Exec(ctx, dropIdentityFKs); err != nil {
+		return fmt.Errorf("ensure dedicated overrides: %w", err)
 	}
 	return nil
 }

@@ -123,6 +123,8 @@ func (h *OperationsHandler) Register(r fiber.Router) {
 	r.Post("/platform/tenants/:id/branches", h.PlatformCreateBranch)
 	r.Get("/branches", h.ListBranches)
 	r.Post("/branches", h.CreateBranch)
+	r.Patch("/branches/:id", h.UpdateBranch)
+	r.Delete("/branches/:id", h.DeleteBranch)
 	r.Get("/branches/:id/rooms", h.BranchRooms)
 	r.Get("/tenant/modules", h.TenantModules)
 	r.Get("/reports/consolidated", h.ConsolidatedReport)

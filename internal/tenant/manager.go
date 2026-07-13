@@ -105,6 +105,26 @@ func (m *Manager) PoolFor(ctx context.Context, mode, dbName string) (*pgxpool.Po
 	if err != nil {
 		return nil, err
 	}
+	// First time this process opens this dedicated DB, bring its schema current
+	// then apply the dedicated-only overrides. This runs at most once per db per
+	// process (the pool is cached below), and it is what auto-heals already-
+	// provisioned dedicated DBs after a deploy WITHOUT any manual DDL:
+	//   - EnsureAppSchema applies any migrations the dedicated DB is missing
+	//     (tracked in schema_migrations, so up-to-date DBs just no-op) plus the
+	//     idempotent ensured-tables — e.g. the payments.category column that the
+	//     dashboard revenue queries need.
+	//   - EnsureDedicatedOverrides drops the identity FKs that can never be
+	//     satisfied in a dedicated DB (see its doc).
+	// Both warn-not-fail: a transient schema error must not take down request
+	// routing, and it retries on the next process/open.
+	if err := db.EnsureAppSchema(ctx); err != nil {
+		m.log.Warn("tenant: dedicated schema ensure failed",
+			zap.String("database", dbName), zap.Error(err))
+	}
+	if err := db.EnsureDedicatedOverrides(ctx); err != nil {
+		m.log.Warn("tenant: dedicated overrides failed",
+			zap.String("database", dbName), zap.Error(err))
+	}
 	m.pools[dbName] = db
 	return db.Pool, nil
 }
@@ -150,6 +170,12 @@ func (m *Manager) Provision(ctx context.Context, dbName string) error {
 	defer tdb.Close()
 	if err := tdb.EnsureAppSchema(ctx); err != nil {
 		return fmt.Errorf("tenant: migrate %s: %w", dbName, err)
+	}
+	// Dedicated DBs must not keep FKs to the (empty) identity tables — see
+	// EnsureDedicatedOverrides. Applied here at provision time so a brand-new
+	// dedicated DB is correct from its first write, not only after first pool open.
+	if err := tdb.EnsureDedicatedOverrides(ctx); err != nil {
+		return fmt.Errorf("tenant: dedicated overrides %s: %w", dbName, err)
 	}
 	m.log.Info("tenant: database migrated", zap.String("database", dbName))
 	return nil

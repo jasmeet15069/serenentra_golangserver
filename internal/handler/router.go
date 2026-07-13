@@ -229,9 +229,6 @@ func Register(app *fiber.App, h Handlers, secret string, pool *pgxpool.Pool, c c
 	if h.AI != nil {
 		h.AI.Register(api)
 	}
-	if h.Compat != nil {
-		h.Compat.Register(api)
-	}
 	if h.Demo != nil {
 		h.Demo.Register(api)
 	}
@@ -276,10 +273,10 @@ func Register(app *fiber.App, h Handlers, secret string, pool *pgxpool.Pool, c c
 		if h.Ops != nil {
 			h.Ops.featureGate = fgate
 		}
-		// The compat data layer (/api/tables/*) is registered before these
-		// middlewares (it self-authenticates), so it would otherwise bypass plan,
-		// module-mask, and role gating. Hand it the gate state so its write path
-		// enforces the same rules table-by-table (see enforceCompatWrite).
+		// The compat data layer additionally enforces plan-inclusion + module-mask
+		// + role-matrix rules itself, table-by-table (see enforceCompatWrite /
+		// enforceCompatRead), since ruleForPath's prefix map doesn't cover
+		// /tables/:table (one path serves many modules). Hand it the gate state.
 		if h.Compat != nil {
 			h.Compat.planGate = gate
 			h.Compat.featureGate = fgate
@@ -291,6 +288,17 @@ func Register(app *fiber.App, h Handlers, secret string, pool *pgxpool.Pool, c c
 		// reachable unauthenticated; its guest-request and platform routes already
 		// self-check, so gating the whole handler here is safe.
 		h.Ops.Register(api)
+	}
+	if h.Compat != nil {
+		// Registered here (after authGate + tenantPool middleware, not in the
+		// public block above) so tenantPool(c, h.pool) inside compat_handler.go
+		// actually resolves the caller's dedicated pool via c.Locals("tenant_pool")
+		// — previously this ran pre-authGate/pre-tenantPool, so compat data for
+		// dedicated-DB tenants always silently landed in the SHARED pool. Every
+		// compat method already self-checks requireAuthenticatedRequest, so
+		// moving it here changes nothing about what's reachable, only fixes
+		// which DB it reaches.
+		h.Compat.Register(api)
 	}
 	if h.Dashboard != nil {
 		h.Dashboard.Register(api)

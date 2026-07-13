@@ -2,6 +2,9 @@
 .env.*
 !.env.example
 
+# deploy target/secrets — keep host/IP out of git; deploy.env.example is the template
+scripts/deploy.env
+
 *.log
 *.out
 *.err
