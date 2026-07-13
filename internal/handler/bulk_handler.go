@@ -9,6 +9,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/hotelharmony/api/internal/cache"
+	"github.com/hotelharmony/api/internal/domain"
 	"github.com/hotelharmony/api/internal/tenant"
 	"github.com/hotelharmony/api/pkg/response"
 )
@@ -21,10 +23,11 @@ type BulkHandler struct {
 	baseHandler
 	pool    *pgxpool.Pool
 	tenants *tenant.Manager
+	cache   cache.Cache
 }
 
-func NewBulkHandler(pool *pgxpool.Pool, secret string, tenants *tenant.Manager) *BulkHandler {
-	return &BulkHandler{baseHandler: newBase(secret), pool: pool, tenants: tenants}
+func NewBulkHandler(pool *pgxpool.Pool, secret string, tenants *tenant.Manager, c cache.Cache) *BulkHandler {
+	return &BulkHandler{baseHandler: newBase(secret), pool: pool, tenants: tenants, cache: c}
 }
 
 func (h *BulkHandler) db(c *fiber.Ctx) *pgxpool.Pool {
@@ -119,6 +122,21 @@ func (h *BulkHandler) Import(c *fiber.Ctx) error {
 			continue
 		}
 		inserted++
+	}
+
+	// Invalidate the caches a fresh import would otherwise leave stale (the room
+	// list is cached 60s, dashboard stats too) — without this, bulk-uploaded rooms
+	// don't appear in Room Management until the TTL lapses.
+	if h.cache != nil && inserted > 0 {
+		hid := hotelID.String()
+		_ = h.cache.Delete(c.Context(),
+			cache.KeyDashboardStats(hid),
+			cache.KeyRoomList(hid, "all"),
+			cache.KeyRoomList(hid, string(domain.RoomStatusAvailable)),
+			cache.KeyRoomList(hid, string(domain.RoomStatusOccupied)),
+			cache.KeyRoomList(hid, string(domain.RoomStatusCleaning)),
+			cache.KeyRoomList(hid, string(domain.RoomStatusMaintenance)),
+		)
 	}
 
 	return response.OK(c, map[string]interface{}{

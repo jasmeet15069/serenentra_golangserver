@@ -37,7 +37,7 @@ func (r *paymentRepository) Create(ctx context.Context, p *domain.Payment) (*dom
 		RETURNING id, hotel_id, payment_number, guest_stay_id, order_id, amount, payment_method, status, processed_by, notes, created_at`
 	p.ID = uuid.New()
 	p.HotelID = DemoHotelID
-	row := r.db.Pool.QueryRow(ctx, q,
+	row := poolFromContext(ctx, r.db.Pool).QueryRow(ctx, q,
 		p.ID, p.HotelID, p.PaymentNumber, p.GuestStayID, p.OrderID,
 		p.Amount, p.PaymentMethod, p.Status, p.ProcessedBy, p.Notes,
 		time.Now().UTC(),
@@ -64,7 +64,7 @@ func (r *paymentRepository) FindByID(ctx context.Context, id uuid.UUID) (*domain
 		LEFT JOIN guest_stays gs ON gs.id = p.guest_stay_id
 		LEFT JOIN rooms rm ON rm.id = gs.room_id
 		WHERE p.hotel_id = $1 AND p.id = $2`
-	row := r.db.Pool.QueryRow(ctx, q, DemoHotelID, id)
+	row := poolFromContext(ctx, r.db.Pool).QueryRow(ctx, q, DemoHotelID, id)
 	p := &domain.Payment{}
 	var guestName, roomNumber *string
 	var guestID, guestStayID, orderID, processedBy, roomID *uuid.UUID
@@ -97,26 +97,26 @@ func (r *paymentRepository) FindByID(ctx context.Context, id uuid.UUID) (*domain
 
 func (r *paymentRepository) UpdateStatus(ctx context.Context, id uuid.UUID, status domain.PaymentStatus, method string) error {
 	const q = `UPDATE payments SET status = $1, payment_method = $2 WHERE hotel_id = $3 AND id = $4`
-	_, err := r.db.Pool.Exec(ctx, q, status, method, DemoHotelID, id)
+	_, err := poolFromContext(ctx, r.db.Pool).Exec(ctx, q, status, method, DemoHotelID, id)
 	return err
 }
 
 func (r *paymentRepository) UpdateAmountAndNotes(ctx context.Context, id uuid.UUID, amount float64, method, notes string) error {
 	const q = `UPDATE payments SET amount = $1, payment_method = $2, status = 'pending', notes = $3 WHERE hotel_id = $4 AND id = $5`
-	_, err := r.db.Pool.Exec(ctx, q, amount, method, notes, DemoHotelID, id)
+	_, err := poolFromContext(ctx, r.db.Pool).Exec(ctx, q, amount, method, notes, DemoHotelID, id)
 	return err
 }
 
 func (r *paymentRepository) Delete(ctx context.Context, id uuid.UUID) error {
 	const q = `DELETE FROM payments WHERE hotel_id = $1 AND id = $2`
-	_, err := r.db.Pool.Exec(ctx, q, DemoHotelID, id)
+	_, err := poolFromContext(ctx, r.db.Pool).Exec(ctx, q, DemoHotelID, id)
 	return err
 }
 
 func (r *paymentRepository) ListSettings(ctx context.Context) ([]domain.PaymentSetting, error) {
 	const q = `SELECT id, hotel_id, gateway_name, webhook_url, is_active, created_by, created_at, updated_at
 	           FROM payment_settings WHERE hotel_id = $1 ORDER BY gateway_name`
-	rows, err := r.db.Pool.Query(ctx, q, DemoHotelID)
+	rows, err := poolFromContext(ctx, r.db.Pool).Query(ctx, q, DemoHotelID)
 	if err != nil {
 		return nil, err
 	}
@@ -142,7 +142,7 @@ func (r *paymentRepository) FindGatewayConfig(ctx context.Context) (*domain.Paym
 		FROM payment_configs
 		WHERE hotel_id = $1`
 	cfg := &domain.PaymentGatewayConfig{}
-	err := r.db.Pool.QueryRow(ctx, q, DemoHotelID).Scan(
+	err := poolFromContext(ctx, r.db.Pool).QueryRow(ctx, q, DemoHotelID).Scan(
 		&cfg.HotelID, &cfg.ActiveGateway, &cfg.DefaultCurrency, &cfg.GatewayMode,
 		&cfg.StripeEnabled, &cfg.StripeAccountID, &cfg.StripePublishableKey,
 		&cfg.StripeSecretKeyEncrypted, &cfg.StripeWebhookSecretEncrypted,

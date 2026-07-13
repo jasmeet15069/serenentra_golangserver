@@ -22,6 +22,22 @@ type DB struct {
 	logger *zap.Logger
 }
 
+// poolFromContext returns the tenant-scoped pool the request middleware stashed
+// under "tenant_pool" (Fiber Locals -> fasthttp user value, readable here via
+// ctx.Value because handlers pass the *fasthttp.RequestCtx), falling back to the
+// repository's own (shared) pool. This makes the shared-pool repositories operate
+// on a dedicated tenant's OWN database when one exists — matching the compat/bulk
+// paths. Without it, repo reads/writes always hit the shared DB, so a dedicated
+// tenant's rooms/reservations created via bulk/compat were invisible to /api/rooms
+// and reservation lookups failed. Non-request contexts (background jobs) carry no
+// such value and correctly fall back to the shared pool.
+func poolFromContext(ctx context.Context, fallback *pgxpool.Pool) *pgxpool.Pool {
+	if p, ok := ctx.Value("tenant_pool").(*pgxpool.Pool); ok && p != nil {
+		return p
+	}
+	return fallback
+}
+
 // New opens and validates a pgxpool connection.
 func New(ctx context.Context, cfg *config.Config, log *zap.Logger) (*DB, error) {
 	poolCfg, err := pgxpool.ParseConfig(cfg.Database.DSN)

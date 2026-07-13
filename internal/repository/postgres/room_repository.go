@@ -56,7 +56,7 @@ func (r *roomRepository) ListRooms(ctx context.Context, hotelID uuid.UUID, statu
 	}
 	q += " ORDER BY floor, room_number"
 
-	rows, err := r.db.Pool.Query(ctx, q, args...)
+	rows, err := poolFromContext(ctx, r.db.Pool).Query(ctx, q, args...)
 	if err != nil {
 		return nil, fmt.Errorf("roomRepo.ListRooms: %w", err)
 	}
@@ -68,7 +68,7 @@ func (r *roomRepository) FindRoomByID(ctx context.Context, hotelID, id uuid.UUID
 	const q = `SELECT id, hotel_id, room_number, room_type, floor, capacity, price_per_night,
 		              status, amenities, created_at, updated_at
 		       FROM rooms WHERE hotel_id = $1 AND id = $2`
-	rows, err := r.db.Pool.Query(ctx, q, hotelID, id)
+	rows, err := poolFromContext(ctx, r.db.Pool).Query(ctx, q, hotelID, id)
 	if err != nil {
 		return nil, err
 	}
@@ -96,7 +96,7 @@ func (r *roomRepository) FindAvailableRoom(ctx context.Context, hotelID uuid.UUI
 	}
 	q += " ORDER BY price_per_night LIMIT 1"
 
-	rows, err := r.db.Pool.Query(ctx, q, args...)
+	rows, err := poolFromContext(ctx, r.db.Pool).Query(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -121,7 +121,7 @@ func (r *roomRepository) CreateRoom(ctx context.Context, hotelID uuid.UUID, rm *
 	rm.ID = uuid.New()
 	rm.HotelID = hotelID
 	now := time.Now().UTC()
-	rows, err := r.db.Pool.Query(ctx, q,
+	rows, err := poolFromContext(ctx, r.db.Pool).Query(ctx, q,
 		rm.ID, rm.HotelID, rm.RoomNumber, rm.RoomType, rm.Floor, rm.Capacity,
 		rm.PricePerNight, rm.Status, rm.Amenities, now,
 	)
@@ -159,7 +159,7 @@ func (r *roomRepository) UpdateRoom(ctx context.Context, hotelID, id uuid.UUID, 
 	q := fmt.Sprintf(`UPDATE rooms SET %s WHERE hotel_id = $%d AND id = $%d
 		RETURNING id, hotel_id, room_number, room_type, floor, capacity, price_per_night,
 		          status, amenities, created_at, updated_at`, strings.Join(set, ", "), i, i+1)
-	rows, err := r.db.Pool.Query(ctx, q, args...)
+	rows, err := poolFromContext(ctx, r.db.Pool).Query(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -175,13 +175,13 @@ func (r *roomRepository) UpdateRoom(ctx context.Context, hotelID, id uuid.UUID, 
 }
 
 func (r *roomRepository) DeleteRoom(ctx context.Context, hotelID, id uuid.UUID) error {
-	_, err := r.db.Pool.Exec(ctx, `DELETE FROM rooms WHERE hotel_id = $1 AND id = $2`, hotelID, id)
+	_, err := poolFromContext(ctx, r.db.Pool).Exec(ctx, `DELETE FROM rooms WHERE hotel_id = $1 AND id = $2`, hotelID, id)
 	return err
 }
 
 func (r *roomRepository) UpdateRoomStatus(ctx context.Context, hotelID, id uuid.UUID, status domain.RoomStatus) error {
 	const q = `UPDATE rooms SET status = $1, updated_at = $2 WHERE hotel_id = $3 AND id = $4`
-	_, err := r.db.Pool.Exec(ctx, q, status, time.Now().UTC(), hotelID, id)
+	_, err := poolFromContext(ctx, r.db.Pool).Exec(ctx, q, status, time.Now().UTC(), hotelID, id)
 	return err
 }
 
@@ -200,7 +200,7 @@ func (r *roomRepository) CreateStay(ctx context.Context, hotelID uuid.UUID, s *d
 	s.ID = uuid.New()
 	s.HotelID = hotelID
 	now := time.Now().UTC()
-	row := r.db.Pool.QueryRow(ctx, q,
+	row := poolFromContext(ctx, r.db.Pool).QueryRow(ctx, q,
 		s.ID, s.HotelID, s.GuestID, s.RoomID, s.GuestName, s.GuestEmail, s.GuestPhone,
 		s.CheckInDate, s.CheckOutDate, s.ActualCheckIn, s.ActualCheckOut,
 		s.TotalAmount, s.Notes, s.Source, s.CreatedBy, now,
@@ -217,7 +217,7 @@ func (r *roomRepository) FindStayByID(ctx context.Context, hotelID, id uuid.UUID
 		FROM guest_stays gs
 		LEFT JOIN rooms r ON r.id = gs.room_id
 		WHERE gs.hotel_id = $1 AND gs.id = $2`
-	row := r.db.Pool.QueryRow(ctx, q, hotelID, id)
+	row := poolFromContext(ctx, r.db.Pool).QueryRow(ctx, q, hotelID, id)
 	return scanEnrichedStay(row)
 }
 
@@ -243,7 +243,7 @@ func (r *roomRepository) ListStays(ctx context.Context, hotelID uuid.UUID, filte
 	}
 	q += " ORDER BY gs.check_in_date DESC"
 
-	rows, err := r.db.Pool.Query(ctx, q, args...)
+	rows, err := poolFromContext(ctx, r.db.Pool).Query(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -288,13 +288,13 @@ func (r *roomRepository) UpdateStay(ctx context.Context, hotelID, id uuid.UUID, 
 	args = append(args, id)
 	args = append(args, hotelID)
 	q := fmt.Sprintf("UPDATE guest_stays SET %s WHERE id = $%d AND hotel_id = $%d", setClauses, i, i+1)
-	_, err := r.db.Pool.Exec(ctx, q, args...)
+	_, err := poolFromContext(ctx, r.db.Pool).Exec(ctx, q, args...)
 	return err
 }
 
 func (r *roomRepository) DeleteStay(ctx context.Context, hotelID, id uuid.UUID) error {
 	const q = `DELETE FROM guest_stays WHERE hotel_id = $1 AND id = $2`
-	_, err := r.db.Pool.Exec(ctx, q, hotelID, id)
+	_, err := poolFromContext(ctx, r.db.Pool).Exec(ctx, q, hotelID, id)
 	return err
 }
 
@@ -309,7 +309,7 @@ func (r *roomRepository) SmartCheckinLookup(ctx context.Context, hotelID uuid.UU
 		WHERE gs.hotel_id = $1 AND (gs.guest_name ILIKE $2 OR gs.guest_phone ILIKE $3)
 		ORDER BY gs.check_in_date DESC
 		LIMIT 1`
-	row := r.db.Pool.QueryRow(ctx, q, hotelID, "%"+guestName+"%", "%"+phone+"%")
+	row := poolFromContext(ctx, r.db.Pool).QueryRow(ctx, q, hotelID, "%"+guestName+"%", "%"+phone+"%")
 	s, err := scanEnrichedStay(row)
 	if err != nil && errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound

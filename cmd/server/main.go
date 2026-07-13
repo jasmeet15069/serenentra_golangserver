@@ -139,7 +139,7 @@ func main() {
 		Asset:          handler.NewAssetHandler(db.Pool),
 		Communications: handler.NewCommunicationsHandler(emailSvc, smsSvc, cfg),
 		POS:            handler.NewPOSHandler(db.Pool, c, cfg.Auth.AccessTokenSecret, tenantMgr),
-		Bulk:           handler.NewBulkHandler(db.Pool, cfg.Auth.AccessTokenSecret, tenantMgr),
+		Bulk:           handler.NewBulkHandler(db.Pool, cfg.Auth.AccessTokenSecret, tenantMgr, c),
 		Monitoring:     handler.NewMonitoringHandler(db.Pool, c, cfg.Auth.AccessTokenSecret),
 		Accounting:     handler.NewAccountingHandler(db.Pool, cfg.Auth.AccessTokenSecret),
 		Demo:           handler.NewDemoHandler(db.Pool, emailSvc, cfg.Auth.AccessTokenSecret),

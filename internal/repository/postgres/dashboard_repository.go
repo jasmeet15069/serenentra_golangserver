@@ -95,7 +95,7 @@ func (r *dashboardRepository) GetStats(ctx context.Context) (*domain.DashboardSt
 		checkingOut  int
 	)
 
-	err := r.db.Pool.QueryRow(ctx, q, today).Scan(
+	err := poolFromContext(ctx, r.db.Pool).QueryRow(ctx, q, today).Scan(
 		&totalRooms, &occupied, &available,
 		&activeOrders, &pendComp,
 		&revenueToday, &lowStock, &staffIn,
@@ -235,7 +235,7 @@ func (r *dashboardRepository) GetChartData(ctx context.Context) (*domain.Dashboa
 	cd := &domain.DashboardChartData{}
 
 	// Revenue trend
-	revRows, _ := r.db.Pool.Query(ctx, revenueTrendQ, dateStr)
+	revRows, _ := poolFromContext(ctx, r.db.Pool).Query(ctx, revenueTrendQ, dateStr)
 	if revRows != nil {
 		defer revRows.Close()
 		for revRows.Next() {
@@ -249,11 +249,11 @@ func (r *dashboardRepository) GetChartData(ctx context.Context) (*domain.Dashboa
 	}
 
 	// Occupancy trend
-	occRows, _ := r.db.Pool.Query(ctx, occupancyTrendQ, dateStr)
+	occRows, _ := poolFromContext(ctx, r.db.Pool).Query(ctx, occupancyTrendQ, dateStr)
 	if occRows != nil {
 		defer occRows.Close()
 		totalRooms := 0
-		_ = r.db.Pool.QueryRow(ctx, `SELECT COUNT(*) FROM rooms`).Scan(&totalRooms)
+		_ = poolFromContext(ctx, r.db.Pool).QueryRow(ctx, `SELECT COUNT(*) FROM rooms`).Scan(&totalRooms)
 		if totalRooms == 0 {
 			totalRooms = 1
 		}
@@ -270,7 +270,7 @@ func (r *dashboardRepository) GetChartData(ctx context.Context) (*domain.Dashboa
 
 	// Department revenue (current month)
 	deptCurrent := make(map[string]float64)
-	deptRows, _ := r.db.Pool.Query(ctx, deptRevenueQ, monthStart)
+	deptRows, _ := poolFromContext(ctx, r.db.Pool).Query(ctx, deptRevenueQ, monthStart)
 	if deptRows != nil {
 		defer deptRows.Close()
 		for deptRows.Next() {
@@ -284,7 +284,7 @@ func (r *dashboardRepository) GetChartData(ctx context.Context) (*domain.Dashboa
 
 	// Department revenue (previous month)
 	deptPrev := make(map[string]float64)
-	deptRows2, _ := r.db.Pool.Query(ctx, deptRevenueQ, prevMonthStart)
+	deptRows2, _ := poolFromContext(ctx, r.db.Pool).Query(ctx, deptRevenueQ, prevMonthStart)
 	if deptRows2 != nil {
 		defer deptRows2.Close()
 		for deptRows2.Next() {
@@ -310,7 +310,7 @@ func (r *dashboardRepository) GetChartData(ctx context.Context) (*domain.Dashboa
 	}
 
 	// Arrivals today
-	arrRows, _ := r.db.Pool.Query(ctx, arrivalsQ, dateStr)
+	arrRows, _ := poolFromContext(ctx, r.db.Pool).Query(ctx, arrivalsQ, dateStr)
 	if arrRows != nil {
 		defer arrRows.Close()
 		for arrRows.Next() {
@@ -324,7 +324,7 @@ func (r *dashboardRepository) GetChartData(ctx context.Context) (*domain.Dashboa
 	}
 
 	// Departures today
-	depRows, _ := r.db.Pool.Query(ctx, departuresQ, dateStr)
+	depRows, _ := poolFromContext(ctx, r.db.Pool).Query(ctx, departuresQ, dateStr)
 	if depRows != nil {
 		defer depRows.Close()
 		for depRows.Next() {
@@ -338,7 +338,7 @@ func (r *dashboardRepository) GetChartData(ctx context.Context) (*domain.Dashboa
 	}
 
 	// Pending payments
-	payRows, _ := r.db.Pool.Query(ctx, pendingPaymentsQ)
+	payRows, _ := poolFromContext(ctx, r.db.Pool).Query(ctx, pendingPaymentsQ)
 	if payRows != nil {
 		defer payRows.Close()
 		for payRows.Next() {
@@ -352,7 +352,7 @@ func (r *dashboardRepository) GetChartData(ctx context.Context) (*domain.Dashboa
 	}
 
 	// Recent activity
-	actRows, _ := r.db.Pool.Query(ctx, activityQ)
+	actRows, _ := poolFromContext(ctx, r.db.Pool).Query(ctx, activityQ)
 	if actRows != nil {
 		defer actRows.Close()
 		for actRows.Next() {
