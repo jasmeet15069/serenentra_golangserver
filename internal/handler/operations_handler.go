@@ -101,6 +101,8 @@ func (h *OperationsHandler) Register(r fiber.Router) {
 	r.Delete("/platform/tenants/:id", h.DeletePlatformTenant)
 	r.Post("/platform/tenants/:id/impersonate", h.PlatformTenantImpersonate)
 	r.Post("/platform/tenants/:id/reset-admin-password", h.PlatformTenantResetAdminPassword)
+	r.Get("/platform/admin-accounts", h.PlatformAdminAccounts)
+	r.Post("/platform/admin-passwords/set-all", h.PlatformSetAllAdminPasswords)
 	r.Get("/platform/tenants/:id/modules", h.PlatformTenantModules)
 	r.Put("/platform/tenants/:id/modules", h.UpdatePlatformTenantModules)
 	r.Get("/platform/tenants/:id/feature-matrix", h.PlatformTenantFeatureMatrix)

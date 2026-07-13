@@ -377,9 +377,23 @@ func (h *OperationsHandler) PlatformTenantResetAdminPassword(c *fiber.Ctx) error
 		}
 	}
 
-	newPassword, err := generateRandomPassword(14)
-	if err != nil {
-		return response.Error(c, fiber.StatusInternalServerError, "failed to generate password")
+	// Optional body: a superadmin-chosen password. Empty/absent → generate a random
+	// one. This is what powers the Password Manager's "set a known password" action.
+	var req struct {
+		NewPassword string `json:"new_password"`
+	}
+	_ = c.BodyParser(&req)
+	newPassword := strings.TrimSpace(req.NewPassword)
+	chosen := newPassword != ""
+	if chosen {
+		if len(newPassword) < 8 {
+			return response.Error(c, fiber.StatusUnprocessableEntity, "password must be at least 8 characters")
+		}
+	} else {
+		newPassword, err = generateRandomPassword(14)
+		if err != nil {
+			return response.Error(c, fiber.StatusInternalServerError, "failed to generate password")
+		}
 	}
 	hash, err := bcrypt.GenerateFromPassword([]byte(newPassword), bcrypt.DefaultCost)
 	if err != nil {
@@ -392,10 +406,129 @@ func (h *OperationsHandler) PlatformTenantResetAdminPassword(c *fiber.Ctx) error
 		return response.Error(c, fiber.StatusInternalServerError, "failed to reset password")
 	}
 
+	warning := "Password set. It is bcrypt-hashed and cannot be retrieved again — copy it now."
+	if !chosen {
+		warning = "This random password is shown once and cannot be retrieved again. Share it securely."
+	}
 	return response.OK(c, fiber.Map{
 		"admin_email":  adminEmail,
 		"new_password": newPassword,
-		"warning":      "This password is shown once and cannot be retrieved again. Share it securely with the client.",
+		"chosen":       chosen,
+		"warning":      warning,
+	})
+}
+
+// PlatformAdminAccounts (GET /api/platform/admin-accounts) lists every client with
+// its admin login email + active status, for the superadmin Password Manager. It
+// does NOT return passwords (they are one-way bcrypt hashes) — use the reset
+// endpoint to set a fresh one.
+func (h *OperationsHandler) PlatformAdminAccounts(c *fiber.Ctx) error {
+	if !h.requirePlatformAdmin(c) {
+		return nil
+	}
+	rows, err := h.pool.Query(c.Context(),
+		`SELECT id, name, slug, COALESCE(is_active,true) FROM hotels ORDER BY name ASC`)
+	if err != nil {
+		return response.Error(c, fiber.StatusInternalServerError, err.Error())
+	}
+	defer rows.Close()
+
+	type acct struct {
+		ID         uuid.UUID `json:"id"`
+		Name       string    `json:"name"`
+		Slug       string    `json:"slug"`
+		IsActive   bool      `json:"is_active"`
+		AdminEmail string    `json:"admin_email"`
+	}
+	out := []acct{}
+	for rows.Next() {
+		var a acct
+		if err := rows.Scan(&a.ID, &a.Name, &a.Slug, &a.IsActive); err != nil {
+			return response.Error(c, fiber.StatusInternalServerError, err.Error())
+		}
+		if _, email, err := h.findTenantAdminUser(c.Context(), a.ID); err == nil {
+			a.AdminEmail = email
+		}
+		out = append(out, a)
+	}
+	return response.OK(c, out)
+}
+
+// PlatformSetAllAdminPasswords (POST /api/platform/admin-passwords/set-all) sets the
+// SAME admin password on every client (creating a default admin for any client that
+// has none). Returns a per-client result. This is the "one password for every
+// client" action — each client keeps its own admin EMAIL, but the password matches.
+func (h *OperationsHandler) PlatformSetAllAdminPasswords(c *fiber.Ctx) error {
+	if !h.requirePlatformAdmin(c) {
+		return nil
+	}
+	var req struct {
+		Password string `json:"password"`
+	}
+	if err := c.BodyParser(&req); err != nil {
+		return response.Error(c, fiber.StatusBadRequest, "invalid request body")
+	}
+	pw := strings.TrimSpace(req.Password)
+	if len(pw) < 8 {
+		return response.Error(c, fiber.StatusUnprocessableEntity, "password must be at least 8 characters")
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(pw), bcrypt.DefaultCost)
+	if err != nil {
+		return response.Error(c, fiber.StatusInternalServerError, "failed to hash password")
+	}
+
+	rows, err := h.pool.Query(c.Context(), `SELECT id, slug FROM hotels ORDER BY name ASC`)
+	if err != nil {
+		return response.Error(c, fiber.StatusInternalServerError, err.Error())
+	}
+	type tgt struct {
+		id   uuid.UUID
+		slug string
+	}
+	targets := []tgt{}
+	for rows.Next() {
+		var t tgt
+		if err := rows.Scan(&t.id, &t.slug); err == nil {
+			targets = append(targets, t)
+		}
+	}
+	rows.Close()
+
+	type result struct {
+		Slug       string `json:"slug"`
+		AdminEmail string `json:"admin_email"`
+		OK         bool   `json:"ok"`
+		Error      string `json:"error,omitempty"`
+	}
+	results := make([]result, 0, len(targets))
+	updated := 0
+	for _, t := range targets {
+		r := result{Slug: t.slug}
+		adminID, email, err := h.findTenantAdminUser(c.Context(), t.id)
+		if err != nil {
+			adminID, email, err = h.ensureTenantAdmin(c.Context(), t.id, t.slug)
+		}
+		if err != nil {
+			r.Error = "no admin account"
+			results = append(results, r)
+			continue
+		}
+		r.AdminEmail = email
+		if _, err := h.pool.Exec(c.Context(),
+			`UPDATE users SET password_hash = $1, updated_at = now() WHERE id = $2`,
+			string(hash), adminID); err != nil {
+			r.Error = err.Error()
+			results = append(results, r)
+			continue
+		}
+		r.OK = true
+		updated++
+		results = append(results, r)
+	}
+	return response.OK(c, fiber.Map{
+		"updated": updated,
+		"total":   len(targets),
+		"results": results,
 	})
 }
 
