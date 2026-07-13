@@ -66,7 +66,10 @@ var bulkEntities = map[string]bulkEntity{
 }
 
 func (h *BulkHandler) Import(c *fiber.Ctx) error {
-	if !h.requireRoles(c, "admin", "super_admin", "food_manager", "platform_admin") {
+	// hotel_admin is the tenant admin on most clients (the admin role is named
+	// hotel_admin / admin / super_admin inconsistently across tenants). It was
+	// missing here, so a hotel_admin bulk-uploading rooms/menu got "access denied".
+	if !h.requireRoles(c, "admin", "hotel_admin", "super_admin", "food_manager", "platform_admin") {
 		return nil
 	}
 	cfg, ok := bulkEntities[c.Params("entity")]
