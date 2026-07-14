@@ -48,6 +48,10 @@ func (h *CRMHandler) Register(r fiber.Router) {
 	g.Get("/crm/loyalty/members", h.ListLoyaltyMembers)
 	g.Post("/crm/loyalty/points/award", h.AwardPoints)
 	g.Post("/crm/loyalty/points/redeem", h.RedeemPoints)
+	g.Get("/crm/campaigns", h.ListCampaigns)
+	g.Post("/crm/campaigns", h.CreateCampaign)
+	g.Patch("/crm/campaigns/:id", h.UpdateCampaign)
+	g.Delete("/crm/campaigns/:id", h.DeleteCampaign)
 }
 
 // ---------------------------------------------------------------------------
@@ -618,4 +622,141 @@ func (h *CRMHandler) RedeemPoints(c *fiber.Ctx) error {
 		"points":         req.Points,
 		"type":           "redeem",
 	})
+}
+
+// ---------------------------------------------------------------------------
+// Marketing campaigns (campaigns table, migration 024). Real CRUD replacing the
+// old hardcoded demo. Tenant-pool routed like the rest of CRM.
+// ---------------------------------------------------------------------------
+
+type campaignResponse struct {
+	ID        uuid.UUID `json:"id"`
+	Name      string    `json:"name"`
+	Audience  string    `json:"audience"`
+	Channel   string    `json:"channel"`
+	Status    string    `json:"status"`
+	Sent      int       `json:"sent"`
+	Opens     int       `json:"opens"`
+	Clicks    int       `json:"clicks"`
+	Revenue   float64   `json:"revenue"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+func (h *CRMHandler) ListCampaigns(c *fiber.Ctx) error {
+	rows, err := tenantPool(c, h.pool).Query(c.Context(), `
+		SELECT id, name, COALESCE(audience,''), channel, status, sent, opens, clicks, revenue, created_at
+		FROM campaigns WHERE hotel_id = $1 ORDER BY created_at DESC`, tenantHotelID(c))
+	if err != nil {
+		return response.Error(c, fiber.StatusInternalServerError, err.Error())
+	}
+	defer rows.Close()
+	items := make([]campaignResponse, 0)
+	for rows.Next() {
+		var it campaignResponse
+		if err := rows.Scan(&it.ID, &it.Name, &it.Audience, &it.Channel, &it.Status,
+			&it.Sent, &it.Opens, &it.Clicks, &it.Revenue, &it.CreatedAt); err != nil {
+			return response.Error(c, fiber.StatusInternalServerError, err.Error())
+		}
+		items = append(items, it)
+	}
+	return response.OK(c, items)
+}
+
+func (h *CRMHandler) CreateCampaign(c *fiber.Ctx) error {
+	var req struct {
+		Name     string `json:"name"`
+		Audience string `json:"audience"`
+		Channel  string `json:"channel"`
+		Status   string `json:"status"`
+	}
+	if err := c.BodyParser(&req); err != nil {
+		return response.Error(c, fiber.StatusBadRequest, "invalid request body")
+	}
+	if strings.TrimSpace(req.Name) == "" {
+		return response.Error(c, fiber.StatusUnprocessableEntity, "campaign name is required")
+	}
+	channel := strings.TrimSpace(req.Channel)
+	if channel == "" {
+		channel = "email"
+	}
+	status := strings.TrimSpace(req.Status)
+	if status == "" {
+		status = "draft"
+	}
+	id := uuid.New()
+	if _, err := tenantPool(c, h.pool).Exec(c.Context(), `
+		INSERT INTO campaigns (id, hotel_id, name, audience, channel, status, created_at, updated_at)
+		VALUES ($1,$2,$3,NULLIF($4,''),$5,$6,now(),now())`,
+		id, tenantHotelID(c), strings.TrimSpace(req.Name), strings.TrimSpace(req.Audience), channel, status); err != nil {
+		return response.Error(c, fiber.StatusBadRequest, err.Error())
+	}
+	return response.Created(c, map[string]interface{}{"id": id, "name": strings.TrimSpace(req.Name), "status": status})
+}
+
+func (h *CRMHandler) UpdateCampaign(c *fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return response.Error(c, fiber.StatusBadRequest, "invalid campaign id")
+	}
+	var req struct {
+		Name     *string `json:"name"`
+		Audience *string `json:"audience"`
+		Channel  *string `json:"channel"`
+		Status   *string `json:"status"`
+	}
+	if err := c.BodyParser(&req); err != nil {
+		return response.Error(c, fiber.StatusBadRequest, "invalid request body")
+	}
+	sets := []string{}
+	args := []interface{}{}
+	idx := 1
+	if req.Name != nil {
+		sets = append(sets, fmt.Sprintf("name = $%d", idx))
+		args = append(args, *req.Name)
+		idx++
+	}
+	if req.Audience != nil {
+		sets = append(sets, fmt.Sprintf("audience = NULLIF($%d,'')", idx))
+		args = append(args, *req.Audience)
+		idx++
+	}
+	if req.Channel != nil {
+		sets = append(sets, fmt.Sprintf("channel = $%d", idx))
+		args = append(args, *req.Channel)
+		idx++
+	}
+	if req.Status != nil {
+		sets = append(sets, fmt.Sprintf("status = $%d", idx))
+		args = append(args, *req.Status)
+		idx++
+	}
+	if len(sets) == 0 {
+		return response.Error(c, fiber.StatusBadRequest, "no fields to update")
+	}
+	sets = append(sets, "updated_at = now()")
+	args = append(args, id, tenantHotelID(c))
+	q := fmt.Sprintf("UPDATE campaigns SET %s WHERE id = $%d AND hotel_id = $%d", strings.Join(sets, ", "), idx, idx+1)
+	tag, err := tenantPool(c, h.pool).Exec(c.Context(), q, args...)
+	if err != nil {
+		return response.Error(c, fiber.StatusBadRequest, err.Error())
+	}
+	if tag.RowsAffected() == 0 {
+		return response.Error(c, fiber.StatusNotFound, "campaign not found")
+	}
+	return response.OK(c, map[string]interface{}{"id": id})
+}
+
+func (h *CRMHandler) DeleteCampaign(c *fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return response.Error(c, fiber.StatusBadRequest, "invalid campaign id")
+	}
+	tag, err := tenantPool(c, h.pool).Exec(c.Context(), `DELETE FROM campaigns WHERE id = $1 AND hotel_id = $2`, id, tenantHotelID(c))
+	if err != nil {
+		return response.Error(c, fiber.StatusBadRequest, err.Error())
+	}
+	if tag.RowsAffected() == 0 {
+		return response.Error(c, fiber.StatusNotFound, "campaign not found")
+	}
+	return response.OK(c, map[string]string{"status": "deleted"})
 }
