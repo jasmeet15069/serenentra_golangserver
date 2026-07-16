@@ -65,7 +65,7 @@ func (h *POSHandler) ListOutlets(c *fiber.Ctx) error {
 }
 
 func (h *POSHandler) CreateOutlet(c *fiber.Ctx) error {
-	if !h.requireRoles(c, "admin", "super_admin", "food_manager", "platform_admin") {
+	if !h.requireRoles(c, "admin", "hotel_admin", "super_admin", "food_manager", "platform_admin") {
 		return nil
 	}
 	var req struct {
@@ -118,7 +118,7 @@ func (h *POSHandler) CreateOutlet(c *fiber.Ctx) error {
 }
 
 func (h *POSHandler) UpdateOutlet(c *fiber.Ctx) error {
-	if !h.requireRoles(c, "admin", "super_admin", "food_manager", "platform_admin") {
+	if !h.requireRoles(c, "admin", "hotel_admin", "super_admin", "food_manager", "platform_admin") {
 		return nil
 	}
 	id, err := uuid.Parse(c.Params("id"))

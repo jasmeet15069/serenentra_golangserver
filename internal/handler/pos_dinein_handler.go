@@ -117,7 +117,7 @@ func (h *POSHandler) ListTables(c *fiber.Ctx) error {
 }
 
 func (h *POSHandler) CreateTable(c *fiber.Ctx) error {
-	if !h.requireRoles(c, "admin", "super_admin", "food_manager", "platform_admin") {
+	if !h.requireRoles(c, "admin", "hotel_admin", "super_admin", "food_manager", "platform_admin") {
 		return nil
 	}
 	var req struct {
@@ -150,7 +150,7 @@ func (h *POSHandler) CreateTable(c *fiber.Ctx) error {
 }
 
 func (h *POSHandler) UpdateTable(c *fiber.Ctx) error {
-	if !h.requireRoles(c, "admin", "super_admin", "food_manager", "platform_admin") {
+	if !h.requireRoles(c, "admin", "hotel_admin", "super_admin", "food_manager", "platform_admin") {
 		return nil
 	}
 	id, err := uuid.Parse(c.Params("id"))
@@ -868,7 +868,7 @@ func (h *POSHandler) FinalizeBill(c *fiber.Ctx) error {
 // AddBillPayment records a payment (cash/card/upi). When the bill is fully paid
 // it transitions to paid and settles the session.
 func (h *POSHandler) AddBillPayment(c *fiber.Ctx) error {
-	if !h.requireRoles(c, "admin", "super_admin", "receptionist", "cashier", "food_manager", "platform_admin") {
+	if !h.requireRoles(c, "admin", "hotel_admin", "super_admin", "receptionist", "cashier", "food_manager", "platform_admin") {
 		return nil
 	}
 	id, err := uuid.Parse(c.Params("id"))

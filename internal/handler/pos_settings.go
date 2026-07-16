@@ -45,7 +45,7 @@ func (h *POSHandler) GetBusinessSettings(c *fiber.Ctx) error {
 }
 
 func (h *POSHandler) UpdateBusinessSettings(c *fiber.Ctx) error {
-	if !h.requireRoles(c, "admin", "super_admin", "food_manager", "platform_admin") {
+	if !h.requireRoles(c, "admin", "hotel_admin", "super_admin", "food_manager", "platform_admin") {
 		return nil
 	}
 	var raw map[string]json.RawMessage
