@@ -73,6 +73,11 @@ func (h *POSHandler) Register(r fiber.Router) {
 	g.Patch("/pos/tables/:id", h.UpdateTable)
 	g.Post("/pos/tables/:id/clean", h.CleanTable)
 
+	g.Get("/pos/waitlist", h.ListWaitlist)
+	g.Post("/pos/waitlist", h.AddWaitlist)
+	g.Patch("/pos/waitlist/:id", h.UpdateWaitlist)
+	g.Delete("/pos/waitlist/:id", h.DeleteWaitlist)
+
 	g.Get("/pos/sessions", h.ListSessions)
 	g.Post("/pos/tables/:id/sessions", h.OpenSession)
 	g.Get("/pos/sessions/:id", h.GetSession)
