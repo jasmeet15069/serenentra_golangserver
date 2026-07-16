@@ -1,4 +1,4 @@
-﻿package handler
+package handler
 
 import (
 	"fmt"
@@ -38,6 +38,7 @@ func (h *RevenueHandler) Register(r fiber.Router) {
 	r.Patch("/revenue/pricing-rules/:id", h.UpdatePricingRule)
 	r.Get("/revenue/yield", h.GetYieldMetrics)
 	r.Get("/revenue/competitors", h.GetCompetitorRates)
+	r.Post("/revenue/apply-adjustment", h.ApplyAdjustment)
 	r.Get("/revenue/forecast", h.GetForecast)
 }
 
@@ -341,4 +342,42 @@ func (h *RevenueHandler) GetForecast(c *fiber.Ctx) error {
 		items = append(items, item)
 	}
 	return response.OK(c, items)
+}
+
+// ApplyAdjustment (POST /api/revenue/apply-adjustment) applies a percentage change
+// to room base rates (all room types, or one) and records it in rate_adjustments.
+// This is the real action behind the Revenue "Apply %" button, which used to only
+// toast. It changes rooms.price_per_night directly, so the caller should confirm.
+func (h *RevenueHandler) ApplyAdjustment(c *fiber.Ctx) error {
+	var req struct {
+		Percent  float64 `json:"percent"`
+		RoomType string  `json:"room_type"`
+	}
+	if err := c.BodyParser(&req); err != nil {
+		return response.Error(c, fiber.StatusBadRequest, "invalid request body")
+	}
+	if req.Percent == 0 {
+		return response.Error(c, fiber.StatusUnprocessableEntity, "percent must be non-zero")
+	}
+	if req.Percent < -90 || req.Percent > 500 {
+		return response.Error(c, fiber.StatusUnprocessableEntity, "percent out of range (-90 to 500)")
+	}
+	factor := 1 + req.Percent/100
+	rt := strings.TrimSpace(req.RoomType)
+	q := `UPDATE rooms SET price_per_night = ROUND(price_per_night * $1, 2), updated_at = now() WHERE hotel_id = $2`
+	args := []interface{}{factor, tenantHotelID(c)}
+	if rt != "" && !strings.EqualFold(rt, "all") {
+		q += " AND room_type = $3"
+		args = append(args, rt)
+	}
+	tag, err := tenantPool(c, h.pool).Exec(c.Context(), q, args...)
+	if err != nil {
+		return response.Error(c, fiber.StatusBadRequest, err.Error())
+	}
+	affected := int(tag.RowsAffected())
+	_, _ = tenantPool(c, h.pool).Exec(c.Context(),
+		`INSERT INTO rate_adjustments (id, hotel_id, percent, room_type, rooms_affected, created_at)
+		 VALUES ($1,$2,$3,NULLIF($4,''),$5,now())`,
+		uuid.New(), tenantHotelID(c), req.Percent, rt, affected)
+	return response.OK(c, fiber.Map{"rooms_affected": affected, "percent": req.Percent})
 }

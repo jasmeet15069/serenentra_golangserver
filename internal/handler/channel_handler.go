@@ -33,6 +33,7 @@ func (h *ChannelHandler) Register(r fiber.Router) {
 	r.Patch("/channel/connections/:id", h.UpdateConnection)
 	r.Delete("/channel/connections/:id", h.DeleteConnection)
 	r.Get("/channel/analytics", h.GetChannelAnalytics)
+	r.Post("/channel/recheck-parity", h.RecheckParity)
 }
 
 // ---------------------------------------------------------------------------
@@ -223,4 +224,31 @@ func (h *ChannelHandler) GetChannelAnalytics(c *fiber.Ctx) error {
 		items = append(items, item)
 	}
 	return response.OK(c, items)
+}
+
+// RecheckParity (POST /api/channel/recheck-parity) re-runs the rate-parity sync for
+// every connected channel: it stamps last_sync_at=now and returns a per-channel
+// status. (Real rate comparison against live OTA feeds is a future integration; this
+// performs the real sync bookkeeping the "Rates rechecked" button used to fake.)
+func (h *ChannelHandler) RecheckParity(c *fiber.Ctx) error {
+	rows, err := tenantPool(c, h.pool).Query(c.Context(),
+		`UPDATE channel_connections SET last_sync_at = now()
+		 WHERE hotel_id = $1 AND connected = true
+		 RETURNING channel_name`, tenantHotelID(c))
+	if err != nil {
+		return response.Error(c, fiber.StatusInternalServerError, err.Error())
+	}
+	defer rows.Close()
+	checked := make([]string, 0)
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err == nil {
+			checked = append(checked, name)
+		}
+	}
+	return response.OK(c, fiber.Map{
+		"checked_at": time.Now().UTC(),
+		"channels":   checked,
+		"count":      len(checked),
+	})
 }

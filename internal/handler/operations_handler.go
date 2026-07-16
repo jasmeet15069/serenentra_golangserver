@@ -140,6 +140,15 @@ func (h *OperationsHandler) Register(r fiber.Router) {
 	r.Put("/settings/payment", h.UpdatePaymentSettings)
 	r.Get("/settings/role-portals", h.RolePortalSettings)
 	r.Put("/settings/role-portals", h.UpdateRolePortalSettings)
+
+	// System Admin: API keys + integrations (hotel-admin only).
+	r.Get("/admin/api-keys", h.ListAPIKeys)
+	r.Post("/admin/api-keys", h.CreateAPIKey)
+	r.Patch("/admin/api-keys/:id", h.UpdateAPIKey)
+	r.Delete("/admin/api-keys/:id", h.DeleteAPIKey)
+	r.Get("/admin/integrations", h.ListIntegrations)
+	r.Patch("/admin/integrations/:provider", h.UpsertIntegration)
+	r.Post("/admin/integrations/:provider/test", h.TestIntegration)
 }
 
 type housekeepingRequest struct {
