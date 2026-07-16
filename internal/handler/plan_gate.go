@@ -59,9 +59,10 @@ var featureRules = map[string]featureRule{
 	// PRO (Basic +)
 	"/revenue":     {"revenue", 1},
 	"/channel":     {"channel_manager", 1},
-	"/pos":         {"pos", 1},
 	"/procurement": {"procurement", 1},
 	"/night-audit": {"night_audit", 1},
+	// POS is available on ALL plans (2026-07-16) — masking only, no plan rank.
+	"/pos": {"pos", 0},
 	// PREMIUM (Pro +)
 	"/email":      {"", 2},
 	"/sms":        {"", 2},

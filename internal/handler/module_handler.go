@@ -1,4 +1,4 @@
-﻿package handler
+package handler
 
 import (
 	"encoding/json"
@@ -95,11 +95,11 @@ func (h *OperationsHandler) loadTenantModules(c *fiber.Ctx, hotelID uuid.UUID) (
 var moduleMinRank = map[string]int{
 	"revenue":         1,
 	"channel_manager": 1,
-	"pos":             1,
-	"restaurant":      1,
-	"menu_management": 1,
 	"procurement":     1,
 	"night_audit":     1,
+	// POS / Restaurant / Menu are available on ALL plans (basic included) as of
+	// 2026-07-16 — hospitality F&B is core, so they are no longer PRO-gated. (Not
+	// listed here = rank 0.) Keep in sync with featureRules("/pos") in plan_gate.go.
 }
 
 // planAwareModules applies the plan tier on top of the per-tenant module mask: a
