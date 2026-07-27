@@ -1078,6 +1078,11 @@ func (h *POSHandler) AddBillPayment(c *fiber.Ctx) error {
 	var journalID uuid.UUID
 	if newStatus == "paid" {
 		journalID, _ = postSalesToLedger(ctx, h.db(c), hotelID, req.Method, b.Subtotal, b.TaxAmount, b.TotalAmount, "BILL "+b.BillNumber, "POS sale — bill "+b.BillNumber)
+		// Phase 2: the inventory/COGS leg — Dr COGS, Cr Inventory using item cost.
+		// No-op until menu items carry a cost_price; never blocks the sale.
+		if cogs := sessionCOGS(ctx, h.db(c), b.SessionID); cogs > 0 {
+			_, _ = postCOGS(ctx, h.db(c), hotelID, cogs, "BILL "+b.BillNumber, "COGS — bill "+b.BillNumber)
+		}
 	}
 	resp := map[string]interface{}{
 		"id": payID, "payment_number": paymentNumber, "method": req.Method, "amount": req.Amount,

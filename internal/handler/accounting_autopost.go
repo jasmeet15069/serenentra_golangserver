@@ -124,3 +124,88 @@ func postSalesToLedger(ctx context.Context, pool *pgxpool.Pool, hotelID uuid.UUI
 		{accountCode: "2100", credit: round2(tax), memo: "GST on sale"},
 	})
 }
+
+// cashAccount returns the ledger code money lands in for a payment method:
+// physical cash -> 1000, everything electronic (card/upi/bank/other) -> 1010 Bank.
+func cashAccount(method string) string {
+	if method == "cash" {
+		return "1000"
+	}
+	return "1010"
+}
+
+// sessionCOGS totals the cost of goods sold for a dining session: sum of
+// quantity * menu_items.cost_price over every non-void KOT item. Free-text items
+// (no menu_item_id) and items with an unset cost contribute 0. Returns 0 on any
+// error so a missing cost table never blocks a sale.
+func sessionCOGS(ctx context.Context, pool *pgxpool.Pool, sessionID uuid.UUID) float64 {
+	var cogs float64
+	_ = pool.QueryRow(ctx, `
+		SELECT COALESCE(SUM(ki.quantity * COALESCE(mi.cost_price, 0)), 0)
+		FROM kot_items ki
+		JOIN kots k ON k.id = ki.kot_id
+		LEFT JOIN menu_items mi ON mi.id = ki.menu_item_id
+		WHERE k.dining_session_id = $1 AND ki.status <> 'void'`, sessionID).Scan(&cogs)
+	return round2(cogs)
+}
+
+// postCOGS records the cost side of a sale: Dr Cost of Goods Sold, Cr Inventory.
+// This is the D365 "inventory reduced" leg — it hits P&L (COGS) and lowers the
+// Inventory asset. Skipped automatically when cogs is 0 (no cost data yet).
+func postCOGS(ctx context.Context, pool *pgxpool.Pool, hotelID uuid.UUID, cogs float64, reference, description string) (uuid.UUID, error) {
+	if round2(cogs) == 0 {
+		return uuid.Nil, nil
+	}
+	return postJournal(ctx, pool, hotelID, description, reference, []journalLine{
+		{accountCode: "5000", debit: round2(cogs), memo: "Cost of goods sold"},
+		{accountCode: "1400", credit: round2(cogs), memo: "Inventory consumed"},
+	})
+}
+
+// postRoomRevenue books a cash/card settlement against room/folio charges:
+// Dr Cash/Bank total, Cr Sales Revenue (net), Cr GST Payable (tax).
+func postRoomRevenue(ctx context.Context, pool *pgxpool.Pool, hotelID uuid.UUID, method string, tax, total float64, reference, description string) (uuid.UUID, error) {
+	return postJournal(ctx, pool, hotelID, description, reference, []journalLine{
+		{accountCode: cashAccount(method), debit: round2(total), memo: "Folio settlement (" + method + ")"},
+		{accountCode: "4000", credit: round2(total - tax), memo: "Room revenue"},
+		{accountCode: "2100", credit: round2(tax), memo: "GST on sale"},
+	})
+}
+
+// postARInvoice books a posted sales invoice on accrual terms:
+// Dr Accounts Receivable total, Cr Sales Revenue (net), Cr GST Payable (tax).
+func postARInvoice(ctx context.Context, pool *pgxpool.Pool, hotelID uuid.UUID, tax, total float64, reference, description string) (uuid.UUID, error) {
+	return postJournal(ctx, pool, hotelID, description, reference, []journalLine{
+		{accountCode: "1200", debit: round2(total), memo: "Invoice receivable"},
+		{accountCode: "4000", credit: round2(total - tax), memo: "Sales revenue"},
+		{accountCode: "2100", credit: round2(tax), memo: "GST on sale"},
+	})
+}
+
+// postCreditNoteReversal reverses revenue on a posted customer credit note:
+// Dr Sales Revenue (net) + Dr GST Payable (tax), Cr Accounts Receivable total.
+func postCreditNoteReversal(ctx context.Context, pool *pgxpool.Pool, hotelID uuid.UUID, tax, total float64, reference, description string) (uuid.UUID, error) {
+	return postJournal(ctx, pool, hotelID, description, reference, []journalLine{
+		{accountCode: "4000", debit: round2(total - tax), memo: "Revenue reversed"},
+		{accountCode: "2100", debit: round2(tax), memo: "GST reversed"},
+		{accountCode: "1200", credit: round2(total), memo: "Receivable credited"},
+	})
+}
+
+// postGoodsReceipt books inventory received against a supplier (D365 GRN post):
+// Dr Inventory, Cr Accounts Payable. amount is the accepted-goods value.
+func postGoodsReceipt(ctx context.Context, pool *pgxpool.Pool, hotelID uuid.UUID, amount float64, reference, description string) (uuid.UUID, error) {
+	return postJournal(ctx, pool, hotelID, description, reference, []journalLine{
+		{accountCode: "1400", debit: round2(amount), memo: "Goods received"},
+		{accountCode: "2000", credit: round2(amount), memo: "Payable to vendor"},
+	})
+}
+
+// postVendorDebitNote books a purchase return / vendor debit note:
+// Dr Accounts Payable total, Cr Inventory total (goods returned reduce what we owe).
+func postVendorDebitNote(ctx context.Context, pool *pgxpool.Pool, hotelID uuid.UUID, total float64, reference, description string) (uuid.UUID, error) {
+	return postJournal(ctx, pool, hotelID, description, reference, []journalLine{
+		{accountCode: "2000", debit: round2(total), memo: "Payable reduced"},
+		{accountCode: "1400", credit: round2(total), memo: "Goods returned"},
+	})
+}

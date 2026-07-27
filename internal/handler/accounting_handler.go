@@ -787,16 +787,24 @@ type lineResp struct {
 
 func (h *AccountingHandler) PostSalesInvoice(c *fiber.Ctx) error {
 	invID := c.Params("id")
-	tag, err := tenantPool(c, h.pool).Exec(c.Context(),
-		`UPDATE accounting_sales_invoices SET status = 'posted', updated_at = now() WHERE id = $1 AND hotel_id = $2 AND status = 'draft'`,
-		invID, h.hotelID(c))
-	if err != nil {
-		return response.Error(c, 500, err.Error())
-	}
-	if tag.RowsAffected() == 0 {
+	pool := tenantPool(c, h.pool)
+	hid := h.hotelID(c)
+	var invNum string
+	var taxTotal, total float64
+	if err := pool.QueryRow(c.Context(),
+		`UPDATE accounting_sales_invoices SET status = 'posted', updated_at = now()
+		 WHERE id = $1 AND hotel_id = $2 AND status = 'draft'
+		 RETURNING invoice_number, tax_total, total`,
+		invID, hid).Scan(&invNum, &taxTotal, &total); err != nil {
 		return response.Error(c, 400, "invoice not found or already posted/cancelled")
 	}
-	return response.OK(c, fiber.Map{"status": "posted"})
+	// Accrual posting: Dr Accounts Receivable, Cr Sales Revenue + GST Payable.
+	journalID, _ := postARInvoice(c.Context(), pool, hid, taxTotal, total, "INV "+invNum, "Sales invoice "+invNum)
+	out := fiber.Map{"status": "posted"}
+	if journalID != uuid.Nil {
+		out["journal_entry"] = journalID.String()
+	}
+	return response.OK(c, out)
 }
 
 func (h *AccountingHandler) CancelSalesInvoice(c *fiber.Ctx) error {
@@ -1011,16 +1019,24 @@ func (h *AccountingHandler) GetCreditNote(c *fiber.Ctx) error {
 }
 
 func (h *AccountingHandler) PostCreditNote(c *fiber.Ctx) error {
-	tag, err := tenantPool(c, h.pool).Exec(c.Context(),
-		`UPDATE accounting_credit_notes SET status = 'posted', updated_at = now() WHERE id = $1 AND hotel_id = $2 AND status = 'draft'`,
-		c.Params("id"), h.hotelID(c))
-	if err != nil {
-		return response.Error(c, 500, err.Error())
-	}
-	if tag.RowsAffected() == 0 {
+	pool := tenantPool(c, h.pool)
+	hid := h.hotelID(c)
+	var cnNum string
+	var taxTotal, total float64
+	if err := pool.QueryRow(c.Context(),
+		`UPDATE accounting_credit_notes SET status = 'posted', updated_at = now()
+		 WHERE id = $1 AND hotel_id = $2 AND status = 'draft'
+		 RETURNING credit_note_number, tax_total, total`,
+		c.Params("id"), hid).Scan(&cnNum, &taxTotal, &total); err != nil {
 		return response.Error(c, 400, "credit note not found or already posted")
 	}
-	return response.OK(c, fiber.Map{"status": "posted"})
+	// Reverse revenue + GST against the customer receivable.
+	journalID, _ := postCreditNoteReversal(c.Context(), pool, hid, taxTotal, total, "CN "+cnNum, "Credit note "+cnNum)
+	out := fiber.Map{"status": "posted"}
+	if journalID != uuid.Nil {
+		out["journal_entry"] = journalID.String()
+	}
+	return response.OK(c, out)
 }
 
 // ---------------------------------------------------------------------------
@@ -1124,16 +1140,24 @@ func (h *AccountingHandler) GetDebitNote(c *fiber.Ctx) error {
 }
 
 func (h *AccountingHandler) PostDebitNote(c *fiber.Ctx) error {
-	tag, err := tenantPool(c, h.pool).Exec(c.Context(),
-		`UPDATE accounting_debit_notes SET status = 'posted', updated_at = now() WHERE id = $1 AND hotel_id = $2 AND status = 'draft'`,
-		c.Params("id"), h.hotelID(c))
-	if err != nil {
-		return response.Error(c, 500, err.Error())
-	}
-	if tag.RowsAffected() == 0 {
+	pool := tenantPool(c, h.pool)
+	hid := h.hotelID(c)
+	var dnNum string
+	var total float64
+	if err := pool.QueryRow(c.Context(),
+		`UPDATE accounting_debit_notes SET status = 'posted', updated_at = now()
+		 WHERE id = $1 AND hotel_id = $2 AND status = 'draft'
+		 RETURNING debit_note_number, total`,
+		c.Params("id"), hid).Scan(&dnNum, &total); err != nil {
 		return response.Error(c, 400, "debit note not found or already posted")
 	}
-	return response.OK(c, fiber.Map{"status": "posted"})
+	// Purchase return: reduce Accounts Payable, credit Inventory.
+	journalID, _ := postVendorDebitNote(c.Context(), pool, hid, total, "DN "+dnNum, "Debit note "+dnNum)
+	out := fiber.Map{"status": "posted"}
+	if journalID != uuid.Nil {
+		out["journal_entry"] = journalID.String()
+	}
+	return response.OK(c, out)
 }
 
 // ---------------------------------------------------------------------------
@@ -1449,16 +1473,29 @@ func (h *AccountingHandler) GetGRN(c *fiber.Ctx) error {
 }
 
 func (h *AccountingHandler) PostGRN(c *fiber.Ctx) error {
-	tag, err := tenantPool(c, h.pool).Exec(c.Context(),
-		`UPDATE accounting_grn SET status = 'posted', updated_at = now() WHERE id = $1 AND hotel_id = $2 AND status = 'draft'`,
-		c.Params("id"), h.hotelID(c))
-	if err != nil {
-		return response.Error(c, 500, err.Error())
-	}
-	if tag.RowsAffected() == 0 {
+	grnID := c.Params("id")
+	pool := tenantPool(c, h.pool)
+	hid := h.hotelID(c)
+	var grnNum string
+	if err := pool.QueryRow(c.Context(),
+		`UPDATE accounting_grn SET status = 'posted', updated_at = now()
+		 WHERE id = $1 AND hotel_id = $2 AND status = 'draft'
+		 RETURNING grn_number`,
+		grnID, hid).Scan(&grnNum); err != nil {
 		return response.Error(c, 400, "GRN not found or already posted")
 	}
-	return response.OK(c, fiber.Map{"status": "posted"})
+	// Value of goods actually accepted into stock = sum of the GRN line totals.
+	var amount float64
+	_ = pool.QueryRow(c.Context(),
+		`SELECT COALESCE(SUM(total), 0) FROM accounting_grn_lines WHERE grn_id = $1 AND hotel_id = $2`,
+		grnID, hid).Scan(&amount)
+	// D365 GRN post: Dr Inventory, Cr Accounts Payable.
+	journalID, _ := postGoodsReceipt(c.Context(), pool, hid, amount, "GRN "+grnNum, "Goods receipt "+grnNum)
+	out := fiber.Map{"status": "posted"}
+	if journalID != uuid.Nil {
+		out["journal_entry"] = journalID.String()
+	}
+	return response.OK(c, out)
 }
 
 // ---------------------------------------------------------------------------

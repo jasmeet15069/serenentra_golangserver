@@ -1,4 +1,4 @@
-﻿package handler
+package handler
 
 import (
 	"context"
@@ -486,7 +486,13 @@ func (h *BillingHandler) RecordPayment(c *fiber.Ctx) error {
 		"status":         "completed",
 	})
 
-	return response.Created(c, map[string]interface{}{
+	// D365-style ledger posting: a folio settlement books Dr Cash/Bank, Cr Sales
+	// Revenue so hotel-room income flows to the trial balance -> P&L + Balance
+	// Sheet, exactly like a POS sale. Tax is not split at collection, so the full
+	// amount lands on revenue. Best-effort — a ledger hiccup never fails the payment.
+	journalID, _ := postRoomRevenue(c.Context(), tenantPool(c, h.pool), tenantHotelID(c), method, 0, req.Amount, "PAY "+paymentNumber, "Room folio payment "+paymentNumber)
+
+	out := map[string]interface{}{
 		"id":             paymentID,
 		"payment_number": paymentNumber,
 		"folio_id":       folioID,
@@ -495,7 +501,11 @@ func (h *BillingHandler) RecordPayment(c *fiber.Ctx) error {
 		"payment_method": method,
 		"status":         "completed",
 		"notes":          notes,
-	})
+	}
+	if journalID != uuid.Nil {
+		out["journal_entry"] = journalID.String()
+	}
+	return response.Created(c, out)
 }
 
 // ---------------------------------------------------------------------------

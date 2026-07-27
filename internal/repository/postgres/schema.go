@@ -301,6 +301,9 @@ func (d *DB) EnsureAppSchema(ctx context.Context) error {
 		`ALTER TABLE pos_orders ADD COLUMN IF NOT EXISTS tax_rate NUMERIC(5,2) NOT NULL DEFAULT 0`,
 		`ALTER TABLE pos_orders ADD COLUMN IF NOT EXISTS tax_mode TEXT NOT NULL DEFAULT 'gst'`,
 		`ALTER TABLE pos_orders ADD COLUMN IF NOT EXISTS tax NUMERIC(12,2) NOT NULL DEFAULT 0`,
+		// Per-item cost, used to auto-post COGS/Inventory on a POS sale (D365-style).
+		// Default 0 -> no COGS journal until a real cost is entered on the menu item.
+		`ALTER TABLE menu_items ADD COLUMN IF NOT EXISTS cost_price NUMERIC(12,2) NOT NULL DEFAULT 0`,
 		// Dedicated GST / tax-invoice identity fields on hotels (see migration 010).
 		// Mirrored here so the columns exist on the always-run schema path even when
 		// the migrations directory is not present at runtime (e.g. some containers).

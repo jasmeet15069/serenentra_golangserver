@@ -1031,7 +1031,7 @@ func (h *CompatHandler) selectMenuCategories(c *fiber.Ctx, filters []compatFilte
 }
 
 func (h *CompatHandler) selectMenuItems(c *fiber.Ctx, filters []compatFilter) error {
-	rows, err := tenantPool(c, h.pool).Query(c.Context(), `SELECT mi.id, mi.category_id, mi.name, mi.description, mi.price, mi.image_url, mi.is_available, mi.preparation_time, mi.created_at, mi.updated_at, mc.name FROM menu_items mi LEFT JOIN menu_categories mc ON mc.id = mi.category_id WHERE mi.hotel_id = $1 ORDER BY mi.name`, h.hotelID(c))
+	rows, err := tenantPool(c, h.pool).Query(c.Context(), `SELECT mi.id, mi.category_id, mi.name, mi.description, mi.price, COALESCE(mi.cost_price,0), mi.image_url, mi.is_available, mi.preparation_time, mi.created_at, mi.updated_at, mc.name FROM menu_items mi LEFT JOIN menu_categories mc ON mc.id = mi.category_id WHERE mi.hotel_id = $1 ORDER BY mi.name`, h.hotelID(c))
 	if err != nil {
 		return response.Error(c, fiber.StatusInternalServerError, err.Error())
 	}
@@ -1040,11 +1040,11 @@ func (h *CompatHandler) selectMenuItems(c *fiber.Ctx, filters []compatFilter) er
 	for rows.Next() {
 		var id, name string
 		var categoryID, description, imageURL, categoryName *string
-		var price float64
+		var price, costPrice float64
 		var isAvailable bool
 		var prep int
 		var createdAt, updatedAt interface{}
-		if err := rows.Scan(&id, &categoryID, &name, &description, &price, &imageURL, &isAvailable, &prep, &createdAt, &updatedAt, &categoryName); err != nil {
+		if err := rows.Scan(&id, &categoryID, &name, &description, &price, &costPrice, &imageURL, &isAvailable, &prep, &createdAt, &updatedAt, &categoryName); err != nil {
 			return response.Error(c, fiber.StatusInternalServerError, err.Error())
 		}
 		customizations, err := h.menuCustomizationsFor(c, id)
@@ -1055,7 +1055,7 @@ func (h *CompatHandler) selectMenuItems(c *fiber.Ctx, filters []compatFilter) er
 		if categoryName != nil {
 			category = map[string]interface{}{"name": *categoryName}
 		}
-		items = append(items, map[string]interface{}{"id": id, "category_id": categoryID, "name": name, "description": description, "price": price, "image_url": imageURL, "is_available": isAvailable, "preparation_time": prep, "created_at": createdAt, "updated_at": updatedAt, "menu_categories": category, "menu_item_customizations": customizations})
+		items = append(items, map[string]interface{}{"id": id, "category_id": categoryID, "name": name, "description": description, "price": price, "cost_price": costPrice, "image_url": imageURL, "is_available": isAvailable, "preparation_time": prep, "created_at": createdAt, "updated_at": updatedAt, "menu_categories": category, "menu_item_customizations": customizations})
 	}
 	return response.OK(c, items)
 }
@@ -1184,7 +1184,7 @@ func (h *CompatHandler) insertMenuItem(c *fiber.Ctx, v map[string]interface{}, s
 		return response.Error(c, fiber.StatusBadRequest, "price cannot be negative")
 	}
 	id := uuid.New().String()
-	rows, err := tenantPool(c, h.pool).Query(c.Context(), `INSERT INTO menu_items (id, hotel_id, category_id, name, description, price, image_url, is_available, preparation_time, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,now(),now()) RETURNING id, category_id, name, description, price, image_url, is_available, preparation_time, created_at, updated_at`, id, h.hotelID(c), nullableString(v["category_id"]), asString(v["name"]), nullableString(v["description"]), asFloatDefault(v["price"], 0), nullableString(v["image_url"]), asBoolDefault(v["is_available"], true), asIntDefault(v["preparation_time"], 15))
+	rows, err := tenantPool(c, h.pool).Query(c.Context(), `INSERT INTO menu_items (id, hotel_id, category_id, name, description, price, cost_price, image_url, is_available, preparation_time, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,now(),now()) RETURNING id, category_id, name, description, price, image_url, is_available, preparation_time, created_at, updated_at`, id, h.hotelID(c), nullableString(v["category_id"]), asString(v["name"]), nullableString(v["description"]), asFloatDefault(v["price"], 0), asFloatDefault(v["cost_price"], 0), nullableString(v["image_url"]), asBoolDefault(v["is_available"], true), asIntDefault(v["preparation_time"], 15))
 	if err != nil {
 		return response.Error(c, fiber.StatusBadRequest, err.Error())
 	}
@@ -1258,7 +1258,7 @@ func (h *CompatHandler) updateMenuCategory(c *fiber.Ctx, id string, v map[string
 }
 
 func (h *CompatHandler) updateMenuItem(c *fiber.Ctx, id string, v map[string]interface{}) error {
-	return h.updateAllowed(c, "menu_items", id, map[string]bool{"category_id": true, "name": true, "description": true, "price": true, "image_url": true, "is_available": true, "preparation_time": true}, v)
+	return h.updateAllowed(c, "menu_items", id, map[string]bool{"category_id": true, "name": true, "description": true, "price": true, "cost_price": true, "image_url": true, "is_available": true, "preparation_time": true}, v)
 }
 
 func (h *CompatHandler) updateMenuCustomization(c *fiber.Ctx, id string, v map[string]interface{}) error {
