@@ -41,6 +41,7 @@ func (h *AccountingHandler) Register(r fiber.Router) {
 	g.Get("/sales-invoices", h.ListSalesInvoices)
 	g.Post("/sales-invoices", h.CreateSalesInvoice)
 	g.Get("/sales-invoices/:id", h.GetSalesInvoice)
+	g.Patch("/sales-invoices/:id", h.UpdateSalesInvoice)
 	g.Post("/sales-invoices/:id/post", h.PostSalesInvoice)
 	g.Post("/sales-invoices/:id/cancel", h.CancelSalesInvoice)
 	g.Post("/sales-invoices/:id/credit-note", h.CreateCreditNoteFromInvoice)
@@ -785,6 +786,121 @@ type lineResp struct {
 	Total       float64 `json:"total"`
 }
 
+// UpdateSalesInvoice edits a DRAFT invoice in place, D365-style: header fields
+// plus a full replace of the lines, with totals recomputed. A posted invoice is
+// immutable — the caller must cancel it or raise a credit note instead.
+func (h *AccountingHandler) UpdateSalesInvoice(c *fiber.Ctx) error {
+	invID := c.Params("id")
+	hid := h.hotelID(c)
+	pool := tenantPool(c, h.pool)
+
+	var req salesInvoiceReq
+	if err := c.BodyParser(&req); err != nil {
+		return response.Error(c, 400, "invalid request")
+	}
+	if len(req.Lines) == 0 {
+		return response.Error(c, 422, "at least one line is required")
+	}
+
+	var status string
+	if err := pool.QueryRow(c.Context(),
+		`SELECT status FROM accounting_sales_invoices WHERE id = $1 AND hotel_id = $2`, invID, hid).Scan(&status); err != nil {
+		return response.Error(c, 404, "invoice not found")
+	}
+	if status != "draft" {
+		return response.Error(c, 409, "only a draft invoice can be edited — cancel it or raise a credit note")
+	}
+
+	var invDate time.Time
+	haveDate := false
+	if req.Date != "" {
+		if parsed, err := time.Parse("2006-01-02", req.Date); err == nil {
+			invDate, haveDate = parsed, true
+		}
+	}
+	var dueDate *time.Time
+	if req.DueDate != "" {
+		if parsed, err := time.Parse("2006-01-02", req.DueDate); err == nil {
+			dueDate = &parsed
+		}
+	}
+
+	// Recompute totals from the incoming lines (mirrors CreateSalesInvoice).
+	var subtotal, discountTotal, taxTotal float64
+	type line struct {
+		accountID uuid.UUID
+		desc      string
+		qty       float64
+		unitPrice float64
+		discount  float64
+		taxRate   float64
+		taxAmt    float64
+		total     float64
+	}
+	lines := []line{}
+	for _, l := range req.Lines {
+		aid, _ := uuid.Parse(l.AccountID)
+		q := l.Quantity
+		if q == 0 {
+			q = 1
+		}
+		lineTotal := q * l.UnitPrice
+		disc := l.Discount
+		lineAfterDisc := lineTotal - disc
+		tax := lineAfterDisc * l.TaxRate / 100
+		subtotal += lineTotal
+		discountTotal += disc
+		taxTotal += tax
+		lines = append(lines, line{
+			accountID: aid, desc: l.Description, qty: q,
+			unitPrice: l.UnitPrice, discount: disc, taxRate: l.TaxRate,
+			taxAmt: tax, total: lineAfterDisc + tax,
+		})
+	}
+	total := subtotal - discountTotal + taxTotal
+
+	tx, err := pool.Begin(c.Context())
+	if err != nil {
+		return response.Error(c, 500, err.Error())
+	}
+	defer tx.Rollback(c.Context())
+
+	custID, _ := uuid.Parse(req.CustomerID)
+	if _, err := tx.Exec(c.Context(), `
+		UPDATE accounting_sales_invoices SET
+			customer_id = COALESCE($3, customer_id),
+			invoice_date = CASE WHEN $4 THEN $5 ELSE invoice_date END,
+			due_date = $6,
+			reference = NULLIF($7,''),
+			notes = NULLIF($8,''),
+			subtotal = $9, discount_total = $10, tax_total = $11, total = $12,
+			updated_at = now()
+		WHERE id = $1 AND hotel_id = $2 AND status = 'draft'`,
+		invID, hid, nullableUUID(custID), haveDate, invDate, dueDate, req.Reference, req.Notes,
+		subtotal, discountTotal, taxTotal, total); err != nil {
+		return response.Error(c, 500, err.Error())
+	}
+
+	// Full replace of the lines.
+	if _, err := tx.Exec(c.Context(), `DELETE FROM accounting_sales_invoice_lines WHERE invoice_id = $1 AND hotel_id = $2`, invID, hid); err != nil {
+		return response.Error(c, 500, err.Error())
+	}
+	for _, l := range lines {
+		if _, err := tx.Exec(c.Context(), `
+			INSERT INTO accounting_sales_invoice_lines
+				(id, invoice_id, hotel_id, account_id, description, quantity, unit_price, discount, tax_rate, tax_amount, total, created_at)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,now())`,
+			uuid.New(), invID, hid, l.accountID, l.desc, l.qty, l.unitPrice, l.discount, l.taxRate, l.taxAmt, l.total); err != nil {
+			return response.Error(c, 500, err.Error())
+		}
+	}
+
+	if err := tx.Commit(c.Context()); err != nil {
+		return response.Error(c, 500, err.Error())
+	}
+	return response.OK(c, fiber.Map{"id": invID, "total": total, "status": "draft"})
+}
+
 func (h *AccountingHandler) PostSalesInvoice(c *fiber.Ctx) error {
 	invID := c.Params("id")
 	pool := tenantPool(c, h.pool)
@@ -809,16 +925,32 @@ func (h *AccountingHandler) PostSalesInvoice(c *fiber.Ctx) error {
 
 func (h *AccountingHandler) CancelSalesInvoice(c *fiber.Ctx) error {
 	invID := c.Params("id")
-	tag, err := tenantPool(c, h.pool).Exec(c.Context(),
-		`UPDATE accounting_sales_invoices SET status = 'cancelled', updated_at = now() WHERE id = $1 AND hotel_id = $2 AND status IN ('draft','posted')`,
-		invID, h.hotelID(c))
-	if err != nil {
+	pool := tenantPool(c, h.pool)
+	hid := h.hotelID(c)
+
+	var status, invNum string
+	if err := pool.QueryRow(c.Context(),
+		`SELECT status, invoice_number FROM accounting_sales_invoices WHERE id = $1 AND hotel_id = $2`, invID, hid).Scan(&status, &invNum); err != nil {
+		return response.Error(c, 404, "invoice not found")
+	}
+	if status != "draft" && status != "posted" {
+		return response.Error(c, 400, "invoice already cancelled")
+	}
+	if _, err := pool.Exec(c.Context(),
+		`UPDATE accounting_sales_invoices SET status = 'cancelled', updated_at = now() WHERE id = $1 AND hotel_id = $2`,
+		invID, hid); err != nil {
 		return response.Error(c, 500, err.Error())
 	}
-	if tag.RowsAffected() == 0 {
-		return response.Error(c, 400, "invoice not found or already cancelled")
+	out := fiber.Map{"status": "cancelled"}
+	// A posted invoice already hit the ledger (Dr AR / Cr Revenue / Cr GST) — cancelling
+	// it must storno that entry so AR and revenue don't stay overstated. A draft never
+	// posted, so there is nothing to reverse.
+	if status == "posted" {
+		if revID, _ := reverseJournalsByReference(c.Context(), pool, hid, "INV "+invNum, "Cancellation — invoice "+invNum); revID != uuid.Nil {
+			out["reversal_entry"] = revID.String()
+		}
 	}
-	return response.OK(c, fiber.Map{"status": "cancelled"})
+	return response.OK(c, out)
 }
 
 func (h *AccountingHandler) CreateCreditNoteFromInvoice(c *fiber.Ctx) error {
