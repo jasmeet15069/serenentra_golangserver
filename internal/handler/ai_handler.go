@@ -48,7 +48,7 @@ func (h *AIHandler) Chat(c *fiber.Ctx) error {
 
 	rooms, _ := h.rooms.ListRooms(c.Context(), tenantHotelID(c), nil)
 	activeOrders, pendingComplaints := 0, 0
-	if stats, err := h.dashboard.GetStats(c.Context()); err == nil {
+	if stats, err := h.dashboard.GetStats(c.Context(), tenantHotelID(c)); err == nil {
 		activeOrders = stats.ActiveOrders
 		pendingComplaints = stats.PendingComplaints
 	}

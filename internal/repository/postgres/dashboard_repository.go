@@ -5,15 +5,26 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/google/uuid"
+	"go.uber.org/zap"
+
 	"github.com/hotelharmony/api/internal/domain"
 )
 
 // DashboardRepository runs the single aggregated query that powers
 // the dashboard stats endpoint. All counters are fetched in one round
 // trip using PostgreSQL CTEs to avoid 10 separate queries.
+//
+// Every query here is scoped to the requesting hotel_id. This matters even
+// though most tenants get their own dedicated database (whose tables
+// physically hold only that tenant's rows): tenants still in 'shared' or
+// 'provisioned' isolation mode (see tenant.Manager) share the primary
+// database, and an unscoped query would sum/count every such tenant's rooms,
+// orders, complaints, revenue, stock, staff and guest activity into one
+// tenant's dashboard.
 type DashboardRepository interface {
-	GetStats(ctx context.Context) (*domain.DashboardStats, error)
-	GetChartData(ctx context.Context) (*domain.DashboardChartData, error)
+	GetStats(ctx context.Context, hotelID uuid.UUID) (*domain.DashboardStats, error)
+	GetChartData(ctx context.Context, hotelID uuid.UUID) (*domain.DashboardChartData, error)
 }
 
 type dashboardRepository struct {
@@ -27,7 +38,7 @@ func NewDashboardRepository(db *DB) DashboardRepository {
 // GetStats executes a single multi-CTE query instead of the original 10
 // sequential SQLite queries. On PostgreSQL with proper indexes this runs
 // in < 5 ms even at thousands of rooms.
-func (r *dashboardRepository) GetStats(ctx context.Context) (*domain.DashboardStats, error) {
+func (r *dashboardRepository) GetStats(ctx context.Context, hotelID uuid.UUID) (*domain.DashboardStats, error) {
 	today := time.Now().UTC().Format("2006-01-02")
 	const q = `
 		WITH
@@ -36,43 +47,43 @@ func (r *dashboardRepository) GetStats(ctx context.Context) (*domain.DashboardSt
 		      COUNT(*)                                          AS total_rooms,
 		      COUNT(*) FILTER (WHERE status = 'occupied')      AS occupied,
 		      COUNT(*) FILTER (WHERE status = 'available')     AS available
-		    FROM rooms
+		    FROM rooms WHERE hotel_id = $2
 		  ),
 		  order_count AS (
 		    SELECT COUNT(*) AS active_orders
 		    FROM orders
-		    WHERE status IN ('pending','preparing','ready')
+		    WHERE hotel_id = $2 AND status IN ('pending','preparing','ready')
 		  ),
 		  complaint_count AS (
 		    SELECT COUNT(*) AS pending_complaints
 		    FROM complaints
-		    WHERE status != 'resolved'
+		    WHERE hotel_id = $2 AND status != 'resolved'
 		  ),
 		  revenue AS (
 		    SELECT COALESCE(SUM(amount), 0) AS revenue_today
 		    FROM payments
-		    WHERE status = 'completed'
+		    WHERE hotel_id = $2 AND status = 'completed'
 		      AND created_at::date = $1::date
 		  ),
 		  stock AS (
 		    SELECT COUNT(*) AS low_stock
 		    FROM inventory_items
-		    WHERE current_stock <= min_stock
+		    WHERE hotel_id = $2 AND current_stock <= min_stock
 		  ),
 		  staff AS (
 		    SELECT COUNT(*) AS clocked_in
 		    FROM staff_shifts
-		    WHERE clock_out IS NULL
+		    WHERE hotel_id = $2 AND clock_out IS NULL
 		  ),
 		  arrivals AS (
 		    SELECT COUNT(*) AS checking_in
 		    FROM guest_stays
-		    WHERE check_in_date::date = $1::date
+		    WHERE hotel_id = $2 AND check_in_date::date = $1::date
 		  ),
 		  departures AS (
 		    SELECT COUNT(*) AS checking_out
 		    FROM guest_stays
-		    WHERE check_out_date::date = $1::date
+		    WHERE hotel_id = $2 AND check_out_date::date = $1::date
 		  )
 		SELECT
 		  rc.total_rooms, rc.occupied, rc.available,
@@ -95,7 +106,7 @@ func (r *dashboardRepository) GetStats(ctx context.Context) (*domain.DashboardSt
 		checkingOut  int
 	)
 
-	err := poolFromContext(ctx, r.db.Pool).QueryRow(ctx, q, today).Scan(
+	err := poolFromContext(ctx, r.db.Pool).QueryRow(ctx, q, today, hotelID).Scan(
 		&totalRooms, &occupied, &available,
 		&activeOrders, &pendComp,
 		&revenueToday, &lowStock, &staffIn,
@@ -169,63 +180,79 @@ type activityRow struct {
 	CreatedAt string `json:"created_at"`
 }
 
-func (r *dashboardRepository) GetChartData(ctx context.Context) (*domain.DashboardChartData, error) {
+func (r *dashboardRepository) GetChartData(ctx context.Context, hotelID uuid.UUID) (*domain.DashboardChartData, error) {
 	today := time.Now().UTC()
+	pool := poolFromContext(ctx, r.db.Pool)
 
+	// Date columns are explicitly cast to text because they scan into a Go
+	// string field below — scanning a native `date`/`timestamp` OID into
+	// *string fails under pgx's cached-statement protocol, and that scan
+	// error was silently swallowed by the `if err == nil` row loops, which is
+	// exactly how this entire chart section went dark: the query succeeded,
+	// every row's Scan quietly failed, and the API returned null with no
+	// trace anywhere. (generate_series' '1 day' step makes `d` a timestamp,
+	// not a date, so it needs ::date::text — plain ::text would print the
+	// full "2026-07-16 00:00:00+00" timestamp instead of a clean date.)
 	const revenueTrendQ = `
-		SELECT d::date AS date,
+		SELECT d::date::text AS date,
 			COALESCE(SUM(amount) FILTER (WHERE category = 'room'), 0) AS room,
 			COALESCE(SUM(amount) FILTER (WHERE category = 'fnb'), 0) AS fnb,
 			COALESCE(SUM(amount) FILTER (WHERE category NOT IN ('room','fnb') OR category IS NULL), 0) AS other
 		FROM generate_series($1::date - 6, $1::date, '1 day') d
-		LEFT JOIN payments ON payments.created_at::date = d AND payments.status = 'completed'
+		LEFT JOIN payments ON payments.created_at::date = d AND payments.status = 'completed' AND payments.hotel_id = $2
 		GROUP BY d ORDER BY d`
 
 	const occupancyTrendQ = `
-		SELECT d::date AS date,
+		SELECT d::date::text AS date,
 			COALESCE(rc.occupied, 0) AS occupied,
 			COALESCE(rc.available, 0) AS available
 		FROM generate_series($1::date - 6, $1::date, '1 day') d
 		LEFT JOIN LATERAL (
 			SELECT COUNT(*) FILTER (WHERE status = 'occupied') AS occupied,
 				COUNT(*) FILTER (WHERE status = 'available') AS available
-			FROM rooms
+			FROM rooms WHERE hotel_id = $2
 		) rc ON true
 		GROUP BY d, rc.occupied, rc.available ORDER BY d`
 
+	// guest_stays carries guest_name directly (no profiles join needed) and has
+	// no status column — status is derived from whether the guest has actually
+	// checked in/out yet.
 	const arrivalsQ = `
-		SELECT p.full_name, r.room_number, gs.status
+		SELECT gs.guest_name, r.room_number,
+			CASE WHEN gs.actual_check_in IS NOT NULL THEN 'checked_in' ELSE 'expected' END
 		FROM guest_stays gs
-		JOIN profiles p ON p.user_id = gs.guest_id
 		JOIN rooms r ON r.id = gs.room_id
-		WHERE gs.check_in_date::date = $1::date
+		WHERE gs.hotel_id = $2 AND gs.check_in_date::date = $1::date
 		ORDER BY gs.created_at LIMIT 10`
 
 	const departuresQ = `
-		SELECT p.full_name, r.room_number, gs.status
+		SELECT gs.guest_name, r.room_number,
+			CASE WHEN gs.actual_check_out IS NOT NULL THEN 'checked_out' ELSE 'expected' END
 		FROM guest_stays gs
-		JOIN profiles p ON p.user_id = gs.guest_id
 		JOIN rooms r ON r.id = gs.room_id
-		WHERE gs.check_out_date::date = $1::date
+		WHERE gs.hotel_id = $2 AND gs.check_out_date::date = $1::date
 		ORDER BY gs.created_at LIMIT 10`
 
 	const pendingPaymentsQ = `
-		SELECT COALESCE(p.full_name, 'Guest'), pay.amount, pay.created_at::date, pay.status
+		SELECT COALESCE(gs.guest_name, 'Guest'), pay.amount, pay.created_at::date::text, pay.status
 		FROM payments pay
 		LEFT JOIN guest_stays gs ON gs.id = pay.guest_stay_id
-		LEFT JOIN profiles p ON p.user_id = gs.guest_id
-		WHERE pay.status IN ('pending', 'overdue')
+		WHERE pay.hotel_id = $1 AND pay.status IN ('pending', 'overdue')
 		ORDER BY pay.created_at DESC LIMIT 10`
 
+	// audit_logs has no user_name column, only user_id — resolve the display
+	// name via profiles, falling back to 'System' for system-triggered entries.
 	const activityQ = `
-		SELECT action, user_name, details, created_at::text
-		FROM audit_logs
-		ORDER BY created_at DESC LIMIT 15`
+		SELECT al.action, COALESCE(p.full_name, 'System'), al.table_name, al.created_at::text
+		FROM audit_logs al
+		LEFT JOIN profiles p ON p.user_id = al.user_id
+		WHERE al.hotel_id = $1
+		ORDER BY al.created_at DESC LIMIT 15`
 
 	const deptRevenueQ = `
 		SELECT category, COALESCE(SUM(amount), 0) AS total
 		FROM payments
-		WHERE status = 'completed' AND created_at >= $1
+		WHERE hotel_id = $2 AND status = 'completed' AND created_at >= $1
 		GROUP BY category ORDER BY total DESC`
 
 	dateStr := today.Format("2006-01-02")
@@ -234,8 +261,18 @@ func (r *dashboardRepository) GetChartData(ctx context.Context) (*domain.Dashboa
 
 	cd := &domain.DashboardChartData{}
 
+	// warn logs a query failure that was previously swallowed silently — every
+	// chart section used to fail invisibly (bare `_` on the error), so a broken
+	// query looked identical to "no data yet" in the API response.
+	warn := func(section string, err error) {
+		if err != nil && r.db.logger != nil {
+			r.db.logger.Warn("dashboardRepo.GetChartData: query failed", zap.String("section", section), zap.Error(err))
+		}
+	}
+
 	// Revenue trend
-	revRows, _ := poolFromContext(ctx, r.db.Pool).Query(ctx, revenueTrendQ, dateStr)
+	revRows, err := pool.Query(ctx, revenueTrendQ, dateStr, hotelID)
+	warn("revenue_trend", err)
 	if revRows != nil {
 		defer revRows.Close()
 		for revRows.Next() {
@@ -244,16 +281,19 @@ func (r *dashboardRepository) GetChartData(ctx context.Context) (*domain.Dashboa
 				cd.RevenueTrend = append(cd.RevenueTrend, domain.ChartRevenuePoint{
 					Date: row.Date, Room: row.Room, FnB: row.FnB, Other: row.Other,
 				})
+			} else {
+				warn("revenue_trend.scan", err)
 			}
 		}
 	}
 
 	// Occupancy trend
-	occRows, _ := poolFromContext(ctx, r.db.Pool).Query(ctx, occupancyTrendQ, dateStr)
+	occRows, err := pool.Query(ctx, occupancyTrendQ, dateStr, hotelID)
+	warn("occupancy_trend", err)
 	if occRows != nil {
 		defer occRows.Close()
 		totalRooms := 0
-		_ = poolFromContext(ctx, r.db.Pool).QueryRow(ctx, `SELECT COUNT(*) FROM rooms`).Scan(&totalRooms)
+		_ = pool.QueryRow(ctx, `SELECT COUNT(*) FROM rooms WHERE hotel_id = $1`, hotelID).Scan(&totalRooms)
 		if totalRooms == 0 {
 			totalRooms = 1
 		}
@@ -264,13 +304,16 @@ func (r *dashboardRepository) GetChartData(ctx context.Context) (*domain.Dashboa
 				cd.OccupancyTrend = append(cd.OccupancyTrend, domain.ChartOccupancyPoint{
 					Date: row.Date, Occupied: row.Occupied, Available: row.Available, Rate: row.Rate,
 				})
+			} else {
+				warn("occupancy_trend.scan", err)
 			}
 		}
 	}
 
 	// Department revenue (current month)
 	deptCurrent := make(map[string]float64)
-	deptRows, _ := poolFromContext(ctx, r.db.Pool).Query(ctx, deptRevenueQ, monthStart)
+	deptRows, err := pool.Query(ctx, deptRevenueQ, monthStart, hotelID)
+	warn("department_revenue.current", err)
 	if deptRows != nil {
 		defer deptRows.Close()
 		for deptRows.Next() {
@@ -278,13 +321,16 @@ func (r *dashboardRepository) GetChartData(ctx context.Context) (*domain.Dashboa
 			var total float64
 			if err := deptRows.Scan(&cat, &total); err == nil {
 				deptCurrent[cat] = total
+			} else {
+				warn("department_revenue.current.scan", err)
 			}
 		}
 	}
 
 	// Department revenue (previous month)
 	deptPrev := make(map[string]float64)
-	deptRows2, _ := poolFromContext(ctx, r.db.Pool).Query(ctx, deptRevenueQ, prevMonthStart)
+	deptRows2, err := pool.Query(ctx, deptRevenueQ, prevMonthStart, hotelID)
+	warn("department_revenue.previous", err)
 	if deptRows2 != nil {
 		defer deptRows2.Close()
 		for deptRows2.Next() {
@@ -292,6 +338,8 @@ func (r *dashboardRepository) GetChartData(ctx context.Context) (*domain.Dashboa
 			var total float64
 			if err := deptRows2.Scan(&cat, &total); err == nil {
 				deptPrev[cat] = total
+			} else {
+				warn("department_revenue.previous.scan", err)
 			}
 		}
 	}
@@ -310,7 +358,8 @@ func (r *dashboardRepository) GetChartData(ctx context.Context) (*domain.Dashboa
 	}
 
 	// Arrivals today
-	arrRows, _ := poolFromContext(ctx, r.db.Pool).Query(ctx, arrivalsQ, dateStr)
+	arrRows, err := pool.Query(ctx, arrivalsQ, dateStr, hotelID)
+	warn("arrivals_today", err)
 	if arrRows != nil {
 		defer arrRows.Close()
 		for arrRows.Next() {
@@ -319,12 +368,15 @@ func (r *dashboardRepository) GetChartData(ctx context.Context) (*domain.Dashboa
 				cd.ArrivalsToday = append(cd.ArrivalsToday, domain.GuestStayItem{
 					GuestName: row.GuestName, Room: row.Room, Status: row.Status,
 				})
+			} else {
+				warn("arrivals_today.scan", err)
 			}
 		}
 	}
 
 	// Departures today
-	depRows, _ := poolFromContext(ctx, r.db.Pool).Query(ctx, departuresQ, dateStr)
+	depRows, err := pool.Query(ctx, departuresQ, dateStr, hotelID)
+	warn("departures_today", err)
 	if depRows != nil {
 		defer depRows.Close()
 		for depRows.Next() {
@@ -333,12 +385,15 @@ func (r *dashboardRepository) GetChartData(ctx context.Context) (*domain.Dashboa
 				cd.DeparturesToday = append(cd.DeparturesToday, domain.GuestStayItem{
 					GuestName: row.GuestName, Room: row.Room, Status: row.Status,
 				})
+			} else {
+				warn("departures_today.scan", err)
 			}
 		}
 	}
 
 	// Pending payments
-	payRows, _ := poolFromContext(ctx, r.db.Pool).Query(ctx, pendingPaymentsQ)
+	payRows, err := pool.Query(ctx, pendingPaymentsQ, hotelID)
+	warn("pending_payments", err)
 	if payRows != nil {
 		defer payRows.Close()
 		for payRows.Next() {
@@ -347,12 +402,15 @@ func (r *dashboardRepository) GetChartData(ctx context.Context) (*domain.Dashboa
 				cd.PendingPayments = append(cd.PendingPayments, domain.PendingPaymentItem{
 					GuestName: row.GuestName, Amount: row.Amount, DueDate: row.DueDate, Status: row.Status,
 				})
+			} else {
+				warn("pending_payments.scan", err)
 			}
 		}
 	}
 
 	// Recent activity
-	actRows, _ := poolFromContext(ctx, r.db.Pool).Query(ctx, activityQ)
+	actRows, err := pool.Query(ctx, activityQ, hotelID)
+	warn("recent_activity", err)
 	if actRows != nil {
 		defer actRows.Close()
 		for actRows.Next() {
@@ -361,6 +419,8 @@ func (r *dashboardRepository) GetChartData(ctx context.Context) (*domain.Dashboa
 				cd.RecentActivity = append(cd.RecentActivity, domain.ActivityItem{
 					Action: row.Action, User: row.User, Details: row.Details, CreatedAt: row.CreatedAt,
 				})
+			} else {
+				warn("recent_activity.scan", err)
 			}
 		}
 	}

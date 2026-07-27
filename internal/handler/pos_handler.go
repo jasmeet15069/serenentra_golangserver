@@ -86,6 +86,7 @@ func (h *POSHandler) Register(r fiber.Router) {
 	g.Post("/pos/sessions/:id/kots", h.CreateKOT)
 	g.Post("/pos/kots/:id/send", h.SendKOT)
 	g.Patch("/pos/kots/:id/status", h.UpdateKOTStatus)
+	g.Post("/pos/kots/:id/items/:itemId/void", h.VoidKOTItem)
 
 	g.Post("/pos/sessions/:id/bill", h.GenerateBill)
 	g.Patch("/pos/bills/:id", h.UpdateBill)
@@ -93,6 +94,8 @@ func (h *POSHandler) Register(r fiber.Router) {
 	g.Post("/pos/bills/:id/payments", h.AddBillPayment)
 	g.Get("/pos/bills/:id/receipt", h.BillReceipt)
 	g.Get("/pos/bills/:id/invoice", h.BillInvoice)
+	g.Get("/pos/bills/:id/splits", h.GetBillSplits)
+	g.Put("/pos/bills/:id/splits", h.SetBillSplits)
 }
 
 const posOrderCols = `id, order_number, outlet, channel, table_label, room_id, customer_name,

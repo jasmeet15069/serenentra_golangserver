@@ -413,6 +413,10 @@ func (d *DB) EnsureAppSchema(ctx context.Context) error {
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_kot_items_kot ON kot_items(kot_id)`,
+		// Per-line HSN/SAC on the KOT item, snapshotted like item_name/unit_price so
+		// a later HSN change on the menu never rewrites an already-billed invoice.
+		// Blank = falls back to the outlet/hotel default HSN on the printed invoice.
+		`ALTER TABLE kot_items ADD COLUMN IF NOT EXISTS hsn_code TEXT`,
 		`CREATE TABLE IF NOT EXISTS bills (
 			id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
 			hotel_id UUID NOT NULL REFERENCES hotels(id) ON DELETE CASCADE,
@@ -459,6 +463,21 @@ func (d *DB) EnsureAppSchema(ctx context.Context) error {
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_bill_payments_bill ON bill_payments(bill_id)`,
+		// Split billing: when the cashier turns the split toggle on, the bill total
+		// is divided across named customers and each split prints its own GST tax
+		// invoice. Rows are replaced wholesale on every save; toggling the split
+		// off deletes them (no splits == split disabled).
+		`CREATE TABLE IF NOT EXISTS bill_splits (
+			id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+			hotel_id UUID NOT NULL REFERENCES hotels(id) ON DELETE CASCADE,
+			bill_id UUID NOT NULL REFERENCES bills(id) ON DELETE CASCADE,
+			split_no INT NOT NULL,
+			customer_name TEXT NOT NULL,
+			share_amount NUMERIC(12,2) NOT NULL DEFAULT 0,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+			UNIQUE (bill_id, split_no)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_bill_splits_bill ON bill_splits(bill_id)`,
 		// Scope dine-in entities to an outlet (migration 011); nullable for back-compat.
 		`ALTER TABLE restaurant_tables ADD COLUMN IF NOT EXISTS outlet_id UUID REFERENCES outlets(id) ON DELETE SET NULL`,
 		`ALTER TABLE dining_sessions ADD COLUMN IF NOT EXISTS outlet_id UUID REFERENCES outlets(id) ON DELETE SET NULL`,

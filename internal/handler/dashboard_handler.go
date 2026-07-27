@@ -35,7 +35,7 @@ func (h *DashboardHandler) Stats(c *fiber.Ctx) error {
 		}
 	}
 
-	stats, err := h.dashboard.GetStats(c.Context())
+	stats, err := h.dashboard.GetStats(c.Context(), tenantHotelID(c))
 	if err != nil {
 		return response.Error(c, fiber.StatusInternalServerError, err.Error())
 	}
@@ -47,11 +47,12 @@ func (h *DashboardHandler) Stats(c *fiber.Ctx) error {
 }
 
 func (h *DashboardHandler) FullData(c *fiber.Ctx) error {
-	stats, err := h.dashboard.GetStats(c.Context())
+	hotelID := tenantHotelID(c)
+	stats, err := h.dashboard.GetStats(c.Context(), hotelID)
 	if err != nil {
 		return response.Error(c, fiber.StatusInternalServerError, err.Error())
 	}
-	charts, err := h.dashboard.GetChartData(c.Context())
+	charts, err := h.dashboard.GetChartData(c.Context(), hotelID)
 	if err != nil {
 		return response.Error(c, fiber.StatusInternalServerError, err.Error())
 	}

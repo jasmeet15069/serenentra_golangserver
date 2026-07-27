@@ -418,7 +418,7 @@ func (h *POSHandler) loadKOTs(ctx context.Context, c *fiber.Ctx, sessionID uuid.
 	// attach items per KOT
 	for idx, k := range kots {
 		irows, err := h.db(c).Query(ctx, `
-			SELECT id, menu_item_id, item_name, quantity, unit_price, modifiers, line_total, notes, status
+			SELECT id, menu_item_id, item_name, quantity, unit_price, modifiers, line_total, notes, status, void_reason
 			FROM kot_items WHERE kot_id = $1 ORDER BY created_at`, ids[idx])
 		if err != nil {
 			return nil, err
@@ -431,8 +431,8 @@ func (h *POSHandler) loadKOTs(ctx context.Context, c *fiber.Ctx, sessionID uuid.
 			var qty int
 			var unit, line float64
 			var mods json.RawMessage
-			var inotes *string
-			if err := irows.Scan(&iid, &menuID, &name, &qty, &unit, &mods, &line, &inotes, &istatus); err != nil {
+			var inotes, ivoidReason *string
+			if err := irows.Scan(&iid, &menuID, &name, &qty, &unit, &mods, &line, &inotes, &istatus, &ivoidReason); err != nil {
 				irows.Close()
 				return nil, err
 			}
@@ -442,6 +442,7 @@ func (h *POSHandler) loadKOTs(ctx context.Context, c *fiber.Ctx, sessionID uuid.
 			items = append(items, map[string]interface{}{
 				"id": iid, "menu_item_id": menuID, "item_name": name, "quantity": qty,
 				"unit_price": unit, "modifiers": mods, "line_total": line, "notes": inotes, "status": istatus,
+				"void_reason": ivoidReason,
 			})
 		}
 		irows.Close()
@@ -466,6 +467,7 @@ func (h *POSHandler) CreateKOT(c *fiber.Ctx) error {
 			UnitPrice  float64         `json:"unit_price"`
 			Modifiers  json.RawMessage `json:"modifiers"`
 			Notes      *string         `json:"notes"`
+			HSNCode    *string         `json:"hsn_code"`
 		} `json:"items"`
 	}
 	if err := c.BodyParser(&req); err != nil {
@@ -515,10 +517,14 @@ func (h *POSHandler) CreateKOT(c *fiber.Ctx) error {
 			mods = json.RawMessage("[]")
 		}
 		lineTotal := round2((it.UnitPrice + sumModifierDeltas(mods)) * float64(it.Quantity))
+		hsn := it.HSNCode
+		if hsn != nil && strings.TrimSpace(*hsn) == "" {
+			hsn = nil
+		}
 		if _, err := tx.Exec(ctx, `
-			INSERT INTO kot_items (hotel_id, kot_id, menu_item_id, item_name, quantity, unit_price, modifiers, line_total, notes)
-			VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9)`,
-			hotelID, kotID, it.MenuItemID, it.ItemName, it.Quantity, it.UnitPrice, string(mods), lineTotal, it.Notes); err != nil {
+			INSERT INTO kot_items (hotel_id, kot_id, menu_item_id, item_name, quantity, unit_price, modifiers, line_total, notes, hsn_code)
+			VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10)`,
+			hotelID, kotID, it.MenuItemID, it.ItemName, it.Quantity, it.UnitPrice, string(mods), lineTotal, it.Notes, hsn); err != nil {
 			return response.Error(c, fiber.StatusBadRequest, "failed to add kot item: "+err.Error())
 		}
 	}
@@ -622,6 +628,96 @@ func (h *POSHandler) UpdateKOTStatus(c *fiber.Ctx) error {
 	}
 	h.audit(ctx, c, "kot.status_changed", "kot", id)
 	return response.OK(c, map[string]interface{}{"id": id, "status": req.Status})
+}
+
+// VoidKOTItem cancels a single wrong/mistaken item without touching the rest of
+// its KOT. Blocked once the session's bill has been finalized/paid (that money
+// is locked; use a refund/adjustment flow instead, not a silent void). While the
+// bill is still open, it is live — the item's revenue simply disappears from the
+// bill's subtotal/tax/total on the next read.
+func (h *POSHandler) VoidKOTItem(c *fiber.Ctx) error {
+	if !h.requireRoles(c, "admin", "hotel_admin", "super_admin", "receptionist", "cashier", "food_manager", "platform_admin") {
+		return nil
+	}
+	kotID, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return response.Error(c, fiber.StatusBadRequest, "invalid kot id")
+	}
+	itemID, err := uuid.Parse(c.Params("itemId"))
+	if err != nil {
+		return response.Error(c, fiber.StatusBadRequest, "invalid item id")
+	}
+	var req struct {
+		Reason string `json:"reason"`
+	}
+	if err := c.BodyParser(&req); err != nil {
+		return response.Error(c, fiber.StatusBadRequest, "invalid request body")
+	}
+	req.Reason = strings.TrimSpace(req.Reason)
+	if req.Reason == "" {
+		return response.Error(c, fiber.StatusUnprocessableEntity, "a void reason is required")
+	}
+	hotelID := h.hotelID(c)
+	userID := h.userID(c)
+	ctx := c.Context()
+
+	tx, err := h.db(c).Begin(ctx)
+	if err != nil {
+		return response.Error(c, fiber.StatusInternalServerError, "failed to start transaction")
+	}
+	defer tx.Rollback(ctx)
+
+	var sessionID uuid.UUID
+	var itemStatus string
+	if err := tx.QueryRow(ctx, `
+		SELECT k.dining_session_id, ki.status
+		FROM kot_items ki JOIN kots k ON k.id = ki.kot_id
+		WHERE ki.id = $1 AND ki.kot_id = $2 AND ki.hotel_id = $3 FOR UPDATE`,
+		itemID, kotID, hotelID).Scan(&sessionID, &itemStatus); err != nil {
+		return response.Error(c, fiber.StatusNotFound, "kot item not found")
+	}
+	if itemStatus == "cancelled" {
+		return response.Error(c, fiber.StatusConflict, "item is already voided")
+	}
+
+	// A bill locked in (finalized/paid/partially_paid) has already been printed
+	// or settled against this item — voiding now would silently change a number
+	// the guest/accountant already relied on.
+	bill, err := scanBill(tx.QueryRow(ctx, `SELECT `+billCols+` FROM bills WHERE dining_session_id = $1 AND status <> 'void' FOR UPDATE`, sessionID))
+	hasBill := err == nil
+	if hasBill && bill.Status != "open" {
+		return response.Error(c, fiber.StatusConflict, "bill is "+bill.Status+"; cannot void an item on a locked bill")
+	}
+
+	if _, err := tx.Exec(ctx, `
+		UPDATE kot_items SET status = 'cancelled', void_reason = $1, voided_by = $2, updated_at = now()
+		WHERE id = $3`, req.Reason, userID, itemID); err != nil {
+		return response.Error(c, fiber.StatusInternalServerError, "failed to void item")
+	}
+
+	if hasBill {
+		var newSubtotal float64
+		if err := tx.QueryRow(ctx, `
+			SELECT COALESCE(SUM(ki.line_total),0)
+			FROM kot_items ki JOIN kots k ON k.id = ki.kot_id
+			WHERE k.dining_session_id = $1 AND ki.status <> 'cancelled'`, sessionID).Scan(&newSubtotal); err != nil {
+			return response.Error(c, fiber.StatusInternalServerError, "failed to recompute bill")
+		}
+		bill.Subtotal = round2(newSubtotal)
+		computeTotals(&bill)
+		if _, err := tx.Exec(ctx, `
+			UPDATE bills SET subtotal=$1, discount_amount=$2, tax_amount=$3, tip_amount=$4, total_amount=$5, amount_due=$6, updated_at=now()
+			WHERE id=$7`,
+			bill.Subtotal, bill.DiscountAmount, bill.TaxAmount, bill.TipAmount, bill.TotalAmount, bill.AmountDue, bill.ID); err != nil {
+			return response.Error(c, fiber.StatusInternalServerError, "failed to update bill totals")
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return response.Error(c, fiber.StatusInternalServerError, "failed to void item")
+	}
+	h.audit(ctx, c, "kot_item.voided", "kot_item", itemID)
+	return response.OK(c, map[string]interface{}{"id": itemID, "status": "cancelled", "reason": req.Reason})
 }
 
 // ---------------------------------------------------------------------------
@@ -974,10 +1070,23 @@ func (h *POSHandler) AddBillPayment(c *fiber.Ctx) error {
 		return response.Error(c, fiber.StatusInternalServerError, "failed to record payment")
 	}
 	h.audit(ctx, c, "payment.recorded", "bill_payment", payID)
-	return response.Created(c, map[string]interface{}{
+
+	// D365-style ledger posting: on full settlement, auto-post the sale as a
+	// balanced journal (Dr Cash/Bank total, Cr F&B Revenue, Cr GST Payable) so it
+	// flows to the trial balance -> P&L + Balance Sheet. Best-effort AFTER commit:
+	// a ledger hiccup must never fail a completed sale (it can be reposted).
+	var journalID uuid.UUID
+	if newStatus == "paid" {
+		journalID, _ = postSalesToLedger(ctx, h.db(c), hotelID, req.Method, b.Subtotal, b.TaxAmount, b.TotalAmount, "BILL "+b.BillNumber, "POS sale — bill "+b.BillNumber)
+	}
+	resp := map[string]interface{}{
 		"id": payID, "payment_number": paymentNumber, "method": req.Method, "amount": req.Amount,
 		"change_due": changeDue, "bill_status": newStatus, "amount_paid": b.AmountPaid, "amount_due": b.AmountDue,
-	})
+	}
+	if journalID != uuid.Nil {
+		resp["journal_entry"] = journalID
+	}
+	return response.Created(c, resp)
 }
 
 // BillReceipt returns the printable receipt payload: bill, line items, payments.
