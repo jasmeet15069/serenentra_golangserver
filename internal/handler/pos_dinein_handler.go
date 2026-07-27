@@ -1094,6 +1094,72 @@ func (h *POSHandler) AddBillPayment(c *fiber.Ctx) error {
 	return response.Created(c, resp)
 }
 
+// RefundBill reverses a settled POS sale the D365 F&O way: it never mutates the
+// posted transaction, it posts an equal-and-opposite journal (reversing both the
+// revenue and the COGS legs), backs the revenue out of the dashboard with a
+// negative payment row, and marks the bill + session refunded. This is how you
+// "edit" a completed POS sale — refund it, then raise a fresh bill with the
+// corrected items. The GL nets to zero and the full trail is preserved.
+func (h *POSHandler) RefundBill(c *fiber.Ctx) error {
+	if !h.requireRoles(c, "admin", "hotel_admin", "super_admin", "food_manager", "platform_admin") {
+		return nil
+	}
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return response.Error(c, fiber.StatusBadRequest, "invalid bill id")
+	}
+	var req struct {
+		Reason string `json:"reason"`
+	}
+	_ = c.BodyParser(&req)
+	hotelID := h.hotelID(c)
+	ctx := c.Context()
+
+	tx, err := h.db(c).Begin(ctx)
+	if err != nil {
+		return response.Error(c, fiber.StatusInternalServerError, "failed to start transaction")
+	}
+	defer tx.Rollback(ctx)
+
+	b, err := scanBill(tx.QueryRow(ctx, `SELECT `+billCols+` FROM bills WHERE id = $1 AND hotel_id = $2 FOR UPDATE`, id, hotelID))
+	if err != nil {
+		return response.Error(c, fiber.StatusNotFound, "bill not found")
+	}
+	if b.Status != "paid" && b.Status != "partially_paid" {
+		return response.Error(c, fiber.StatusConflict, "only a paid bill can be refunded")
+	}
+
+	// Back out the revenue that was mirrored into `payments` on settlement. A
+	// negative 'completed' row nets the bill out of dashboard revenue without
+	// deleting the original (audit-preserving, same as the ledger reversal).
+	if b.AmountPaid > 0 {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO payments (id, hotel_id, payment_number, amount, payment_method, status, processed_by, notes, category, created_at)
+			VALUES ($1,$2,$3,$4,$5,'completed',$6,$7,'fnb',now())`,
+			uuid.New(), hotelID, genNumber("REF"), -b.AmountPaid, "refund", h.userID(c), "Refund bill "+b.BillNumber); err != nil {
+			return response.Error(c, fiber.StatusInternalServerError, "failed to record refund: "+err.Error())
+		}
+	}
+	if _, err := tx.Exec(ctx, `UPDATE bills SET status = 'refunded', updated_at = now() WHERE id = $1`, id); err != nil {
+		return response.Error(c, fiber.StatusInternalServerError, "failed to update bill")
+	}
+	if _, err := tx.Exec(ctx, `UPDATE dining_sessions SET status = 'refunded', updated_at = now() WHERE id = $1`, b.SessionID); err != nil {
+		return response.Error(c, fiber.StatusInternalServerError, "failed to update session")
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return response.Error(c, fiber.StatusInternalServerError, "failed to refund")
+	}
+	h.audit(ctx, c, "bill.refunded", "bill", id)
+
+	// Storno the ledger: reverse every journal posted under this bill (revenue + COGS).
+	reversalID, _ := reverseJournalsByReference(ctx, h.db(c), hotelID, "BILL "+b.BillNumber, "Refund — bill "+b.BillNumber)
+	resp := map[string]interface{}{"id": id, "status": "refunded", "refunded_amount": b.AmountPaid}
+	if reversalID != uuid.Nil {
+		resp["reversal_entry"] = reversalID
+	}
+	return response.OK(c, resp)
+}
+
 // BillReceipt returns the printable receipt payload: bill, line items, payments.
 func (h *POSHandler) BillReceipt(c *fiber.Ctx) error {
 	id, err := uuid.Parse(c.Params("id"))

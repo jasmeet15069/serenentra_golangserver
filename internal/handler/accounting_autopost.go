@@ -201,6 +201,56 @@ func postGoodsReceipt(ctx context.Context, pool *pgxpool.Pool, hotelID uuid.UUID
 	})
 }
 
+// reverseJournalsByReference posts one storno (reversing) entry that swaps debit
+// and credit for every line of every journal already posted under `reference`.
+// This is the D365 F&O correction model: a posted sale is never edited in place —
+// it is cancelled by an equal-and-opposite entry, so the audit trail is preserved
+// and the net GL effect is zero. Reverses all legs at once (e.g. both the revenue
+// and the COGS entry of a POS bill). Returns the new entry id, or Nil if nothing
+// carried that reference.
+func reverseJournalsByReference(ctx context.Context, pool *pgxpool.Pool, hotelID uuid.UUID, reference, description string) (uuid.UUID, error) {
+	rows, err := pool.Query(ctx, `
+		SELECT jl.account_id, jl.debit, jl.credit
+		FROM accounting_journal_lines jl
+		JOIN accounting_journal_entries je ON je.id = jl.entry_id
+		WHERE je.hotel_id = $1 AND je.reference = $2`, hotelID, reference)
+	if err != nil {
+		return uuid.Nil, err
+	}
+	type rl struct {
+		acct          uuid.UUID
+		debit, credit float64
+	}
+	var src []rl
+	for rows.Next() {
+		var r rl
+		if err := rows.Scan(&r.acct, &r.debit, &r.credit); err == nil {
+			src = append(src, r)
+		}
+	}
+	rows.Close()
+	if len(src) == 0 {
+		return uuid.Nil, nil
+	}
+	entryID := uuid.New()
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO accounting_journal_entries (id, hotel_id, entry_date, description, reference, created_at)
+		VALUES ($1,$2,CURRENT_DATE,$3,$4,now())`,
+		entryID, hotelID, description, reference+" REV"); err != nil {
+		return uuid.Nil, err
+	}
+	for _, r := range src {
+		// Swap: the reversal debits what was credited and credits what was debited.
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO accounting_journal_lines (id, entry_id, hotel_id, account_id, debit, credit, memo, created_at)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,now())`,
+			uuid.New(), entryID, hotelID, r.acct, round2(r.credit), round2(r.debit), "Reversal"); err != nil {
+			return uuid.Nil, err
+		}
+	}
+	return entryID, nil
+}
+
 // postVendorDebitNote books a purchase return / vendor debit note:
 // Dr Accounts Payable total, Cr Inventory total (goods returned reduce what we owe).
 func postVendorDebitNote(ctx context.Context, pool *pgxpool.Pool, hotelID uuid.UUID, total float64, reference, description string) (uuid.UUID, error) {

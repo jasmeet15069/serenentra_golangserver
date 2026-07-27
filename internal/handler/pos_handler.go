@@ -92,6 +92,7 @@ func (h *POSHandler) Register(r fiber.Router) {
 	g.Patch("/pos/bills/:id", h.UpdateBill)
 	g.Post("/pos/bills/:id/finalize", h.FinalizeBill)
 	g.Post("/pos/bills/:id/payments", h.AddBillPayment)
+	g.Post("/pos/bills/:id/refund", h.RefundBill)
 	g.Get("/pos/bills/:id/receipt", h.BillReceipt)
 	g.Get("/pos/bills/:id/invoice", h.BillInvoice)
 	g.Get("/pos/bills/:id/splits", h.GetBillSplits)
