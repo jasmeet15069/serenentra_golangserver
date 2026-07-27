@@ -251,6 +251,15 @@ func reverseJournalsByReference(ctx context.Context, pool *pgxpool.Pool, hotelID
 	return entryID, nil
 }
 
+// postAPSettlement books paying a supplier: Dr Accounts Payable, Cr Cash/Bank.
+// Clears the payable that a goods receipt (or vendor invoice) created.
+func postAPSettlement(ctx context.Context, pool *pgxpool.Pool, hotelID uuid.UUID, method string, amount float64, reference, description string) (uuid.UUID, error) {
+	return postJournal(ctx, pool, hotelID, description, reference, []journalLine{
+		{accountCode: "2000", debit: round2(amount), memo: "Payable settled"},
+		{accountCode: cashAccount(method), credit: round2(amount), memo: "Vendor payment (" + method + ")"},
+	})
+}
+
 // postVendorDebitNote books a purchase return / vendor debit note:
 // Dr Accounts Payable total, Cr Inventory total (goods returned reduce what we owe).
 func postVendorDebitNote(ctx context.Context, pool *pgxpool.Pool, hotelID uuid.UUID, total float64, reference, description string) (uuid.UUID, error) {

@@ -38,6 +38,9 @@ func (h *AccountingHandler) Register(r fiber.Router) {
 	g.Get("/vendors/:id", h.GetVendor)
 	g.Patch("/vendors/:id", h.UpdateVendor)
 
+	g.Get("/vendor-payments", h.ListVendorPayments)
+	g.Post("/vendor-payments", h.CreateVendorPayment)
+
 	g.Get("/sales-invoices", h.ListSalesInvoices)
 	g.Post("/sales-invoices", h.CreateSalesInvoice)
 	g.Get("/sales-invoices/:id", h.GetSalesInvoice)
@@ -553,6 +556,95 @@ func (h *AccountingHandler) UpdateVendor(c *fiber.Ctx) error {
 		return response.Error(c, 404, "vendor not found")
 	}
 	return response.OK(c, fiber.Map{"updated": true})
+}
+
+// ---------------------------------------------------------------------------
+// Vendor Payments (Accounts Payable settlement)
+// ---------------------------------------------------------------------------
+
+type vendorPaymentReq struct {
+	VendorID  string  `json:"vendor_id"`
+	Date      string  `json:"date"`
+	Amount    float64 `json:"amount"`
+	Method    string  `json:"method"`
+	Reference string  `json:"reference"`
+	Notes     string  `json:"notes"`
+}
+
+func (h *AccountingHandler) ListVendorPayments(c *fiber.Ctx) error {
+	rows, err := tenantPool(c, h.pool).Query(c.Context(),
+		`SELECT id, COALESCE(vendor_id::text,''), payment_number, date, amount, method, COALESCE(reference,''), COALESCE(notes,''), created_at
+		 FROM accounting_vendor_payments WHERE hotel_id = $1 ORDER BY date DESC, created_at DESC`, h.hotelID(c))
+	if err != nil {
+		return response.Error(c, 500, err.Error())
+	}
+	defer rows.Close()
+	type vp struct {
+		ID      string    `json:"id"`
+		VendID  string    `json:"vendor_id"`
+		Num     string    `json:"payment_number"`
+		Date    string    `json:"date"`
+		Amount  float64   `json:"amount"`
+		Method  string    `json:"method"`
+		Ref     string    `json:"reference"`
+		Notes   string    `json:"notes"`
+		Created time.Time `json:"created_at"`
+	}
+	out := []vp{}
+	for rows.Next() {
+		var r vp
+		var d time.Time
+		if err := rows.Scan(&r.ID, &r.VendID, &r.Num, &d, &r.Amount, &r.Method, &r.Ref, &r.Notes, &r.Created); err != nil {
+			return response.Error(c, 500, err.Error())
+		}
+		r.Date = d.Format("2006-01-02")
+		out = append(out, r)
+	}
+	return response.OK(c, out)
+}
+
+// CreateVendorPayment records paying a supplier and settles Accounts Payable:
+// Dr Accounts Payable, Cr Cash/Bank. This closes the purchase loop — GRN raised
+// the payable, the payment clears it.
+func (h *AccountingHandler) CreateVendorPayment(c *fiber.Ctx) error {
+	var req vendorPaymentReq
+	if err := c.BodyParser(&req); err != nil {
+		return response.Error(c, 400, "invalid request")
+	}
+	if req.Amount <= 0 {
+		return response.Error(c, 422, "amount must be positive")
+	}
+	hid := h.hotelID(c)
+	pool := tenantPool(c, h.pool)
+	method := req.Method
+	if method == "" {
+		method = "cash"
+	}
+	var slug string
+	_ = pool.QueryRow(c.Context(), `SELECT slug FROM hotels WHERE id = $1`, hid).Scan(&slug)
+	payNum := fmt.Sprintf("VP-%s-%d", slug, time.Now().UnixMilli())
+
+	payDate := time.Now()
+	if req.Date != "" {
+		if parsed, err := time.Parse("2006-01-02", req.Date); err == nil {
+			payDate = parsed
+		}
+	}
+	id := uuid.New()
+	vid, _ := uuid.Parse(req.VendorID)
+	if _, err := pool.Exec(c.Context(), `
+		INSERT INTO accounting_vendor_payments (id, hotel_id, vendor_id, payment_number, date, amount, method, reference, notes, created_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,NULLIF($8,''),NULLIF($9,''),now())`,
+		id, hid, nullableUUID(vid), payNum, payDate, req.Amount, method, req.Reference, req.Notes); err != nil {
+		return response.Error(c, 500, err.Error())
+	}
+	// Dr Accounts Payable, Cr Cash/Bank.
+	journalID, _ := postAPSettlement(c.Context(), pool, hid, method, req.Amount, "VP "+payNum, "Vendor payment "+payNum)
+	out := fiber.Map{"id": id.String(), "payment_number": payNum, "amount": req.Amount}
+	if journalID != uuid.Nil {
+		out["journal_entry"] = journalID.String()
+	}
+	return response.Created(c, out)
 }
 
 // ---------------------------------------------------------------------------

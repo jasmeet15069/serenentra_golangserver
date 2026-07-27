@@ -662,6 +662,19 @@ func (d *DB) EnsureAppSchema(ctx context.Context) error {
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 			UNIQUE(hotel_id, debit_note_number)
 		)`,
+		`CREATE TABLE IF NOT EXISTS accounting_vendor_payments (
+			id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+			hotel_id UUID NOT NULL REFERENCES hotels(id) ON DELETE CASCADE,
+			vendor_id UUID REFERENCES accounting_vendors(id),
+			payment_number TEXT NOT NULL,
+			date DATE NOT NULL DEFAULT CURRENT_DATE,
+			amount NUMERIC(14,2) NOT NULL DEFAULT 0,
+			method TEXT NOT NULL DEFAULT $$cash$$,
+			reference TEXT,
+			notes TEXT,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+			UNIQUE(hotel_id, payment_number)
+		)`,
 		`CREATE TABLE IF NOT EXISTS accounting_purchase_orders (
 			id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
 			hotel_id UUID NOT NULL REFERENCES hotels(id) ON DELETE CASCADE,
