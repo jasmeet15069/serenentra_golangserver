@@ -290,6 +290,12 @@ func (h *POSHandler) Create(c *fiber.Ctx) error {
 		return response.Error(c, fiber.StatusBadRequest, err.Error())
 	}
 	h.invalidate(c)
+
+	// An order can be created already settled (quick sale), which must reach the
+	// ledger just like a later PATCH to paid would.
+	postLegacyPOSOrder(c.Context(), h.db(c), h.hotelID(c), o.OrderNumber, o.Status,
+		"", derefStr(o.CustomerName), o.Subtotal, o.Tax, o.Total)
+
 	return response.Created(c, o)
 }
 
@@ -347,6 +353,13 @@ func (h *POSHandler) Update(c *fiber.Ctx) error {
 		return response.Error(c, fiber.StatusBadRequest, scanErr.Error())
 	}
 	h.invalidate(c)
+
+	// Book the sale if this left the order settled. Idempotent by order number,
+	// because PATCH is a generic column patcher a client may repeat. Runs after
+	// the row is committed: a ledger hiccup must never fail a completed sale.
+	postLegacyPOSOrder(c.Context(), h.db(c), h.hotelID(c), o.OrderNumber, o.Status,
+		"", derefStr(o.CustomerName), o.Subtotal, o.Tax, o.Total)
+
 	return response.OK(c, o)
 }
 

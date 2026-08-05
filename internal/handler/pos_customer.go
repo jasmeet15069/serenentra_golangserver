@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 
 	"github.com/google/uuid"
@@ -180,4 +181,69 @@ func nilAsNull(id uuid.UUID) interface{} {
 		return nil
 	}
 	return id
+}
+
+// --- Legacy /pos/orders ledger posting -------------------------------------
+//
+// The pos_orders path predates the dine-in flow and never posted to the general
+// ledger, so sales taken through it were invisible to accounting: on the
+// testingxyz tenant four settled orders worth INR 5,074 produced no journal
+// entries at all. Dine-in posts on settlement; this gives the legacy path the
+// same treatment so no sale escapes the books whichever screen took it.
+
+// isPaidStatus reports whether a legacy order status means the money is in.
+// The column is free text and has been written with several spellings.
+func isPaidStatus(s string) bool {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "paid", "completed", "settled", "closed":
+		return true
+	default:
+		return false
+	}
+}
+
+// alreadyPosted reports whether a journal already exists for this reference.
+// PATCH /pos/orders/:id is a generic column patcher a client may send more than
+// once, so without this guard the same sale would be booked repeatedly.
+func alreadyPosted(ctx context.Context, pool *pgxpool.Pool, hotelID uuid.UUID, reference string) bool {
+	var n int
+	if err := pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM accounting_journal_entries WHERE hotel_id=$1 AND reference=$2`,
+		hotelID, reference).Scan(&n); err != nil {
+		// On error, assume posted: skipping a journal is recoverable by
+		// reposting, double-booking revenue is not.
+		return true
+	}
+	return n > 0
+}
+
+// postLegacyPOSOrder books a settled legacy order. Amounts come from the stored
+// row rather than the request, so a patched total cannot mis-state revenue.
+// customerName is the only customer signal the legacy table carries; a phone is
+// not collected there, so a customer is linked only when one already matches.
+func postLegacyPOSOrder(ctx context.Context, pool *pgxpool.Pool, hotelID uuid.UUID, orderNumber, status, paymentMethod, customerName string, subtotal, tax, total float64) {
+	if !isPaidStatus(status) || round2(total) == 0 {
+		return
+	}
+	reference := "ORDER " + orderNumber
+	if alreadyPosted(ctx, pool, hotelID, reference) {
+		return
+	}
+	method := strings.ToLower(strings.TrimSpace(paymentMethod))
+	if method == "" {
+		method = "cash"
+	}
+	if _, err := postSalesToLedger(ctx, pool, hotelID, method, subtotal, tax, total,
+		reference, "POS sale — order "+orderNumber); err != nil {
+		log.Printf("pos: LEDGER POST FAILED for legacy order %s (%.2f, %s): %v — sale stands, journal missing",
+			orderNumber, total, method, err)
+	}
+}
+
+// derefStr flattens an optional string column to a value.
+func derefStr(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
 }
