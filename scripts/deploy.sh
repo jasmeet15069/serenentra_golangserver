@@ -10,6 +10,13 @@
 # fill it in. Required: VM_HOST (user@host), REMOTE_DIR (path to golangserver on
 # the VM). Optional: SSH_OPTS, COMPOSE_FILE, HEALTH_URL.
 #
+# The remote step passes the VM's .env to compose with --env-file rather than
+# sourcing it into the shell. Sourcing executes the file, so any unquoted value
+# containing a space runs its second word as a command and aborts the deploy
+# under `set -e`. A Gmail app password (four space-separated groups) in
+# SMTP_PASSWORD did exactly that. Compose's own dotenv parser handles such
+# values correctly and never executes them.
+#
 # Usage:
 #   bash scripts/deploy.sh            # build + deploy
 #   DRY_RUN=1 bash scripts/deploy.sh  # tar + print what would run, ship nothing
@@ -55,9 +62,8 @@ ssh $SSH_OPTS "$VM_HOST" "set -e
   (cd '$REMOTE_DIR' && tar -czf /tmp/deploy-backup-${stamp}/golangserver-src.tar.gz cmd internal pkg migrations go.mod go.sum)
   tar -xzf '$remote_tar' -C '$REMOTE_DIR'
   cd '$COMPOSE_DIR'
-  set -a; . '$REMOTE_DIR/.env'; set +a
-  docker compose -f '$COMPOSE_FILE' build api
-  docker compose -f '$COMPOSE_FILE' up -d api"
+  docker compose --env-file '$REMOTE_DIR/.env' -f '$COMPOSE_FILE' build api
+  docker compose --env-file '$REMOTE_DIR/.env' -f '$COMPOSE_FILE' up -d api"
 
 # 4. Verify it came back healthy.
 echo "==> health check"
