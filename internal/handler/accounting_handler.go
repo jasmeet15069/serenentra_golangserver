@@ -1837,12 +1837,16 @@ func (h *AccountingHandler) GetJournalEntry(c *fiber.Ctx) error {
 		Date        string            `json:"date"`
 		Description string            `json:"description"`
 		Reference   string            `json:"reference"`
+		VoucherNo   string            `json:"voucher_no"`
+		VoucherType string            `json:"voucher_type"`
 		Lines       []journalLineResp `json:"lines"`
 	}
 	var d time.Time
 	if err := tenantPool(c, h.pool).QueryRow(c.Context(),
-		`SELECT id, entry_date, description, COALESCE(reference,'') FROM accounting_journal_entries WHERE id = $1 AND hotel_id = $2`,
-		entryID, hid).Scan(&r.ID, &d, &r.Description, &r.Reference); err != nil {
+		`SELECT id, entry_date, description, COALESCE(reference,''),
+		        COALESCE(voucher_no,''), COALESCE(voucher_type,'')
+		 FROM accounting_journal_entries WHERE id = $1 AND hotel_id = $2`,
+		entryID, hid).Scan(&r.ID, &d, &r.Description, &r.Reference, &r.VoucherNo, &r.VoucherType); err != nil {
 		return response.Error(c, 404, "journal entry not found")
 	}
 	r.Date = d.Format("2006-01-02")
