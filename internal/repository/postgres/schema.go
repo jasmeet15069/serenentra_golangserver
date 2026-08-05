@@ -735,6 +735,37 @@ func (d *DB) EnsureAppSchema(ctx context.Context) error {
 			memo TEXT,
 			created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
+
+		// --- POS dine-in <-> accounting customer link ---
+		//
+		// A dine-in session previously carried only a free-text guest_name, and
+		// settlement posted Dr Cash/Bank, Cr Revenue, Cr GST with no customer
+		// dimension. Nothing a POS customer did could reach accounting_customers,
+		// so managers had no record to review or edit and a credit sale had no
+		// receivable to chase.
+		//
+		// These live here rather than in migrations/ because dining_sessions,
+		// bills and accounting_customers are all created by this statement list,
+		// and runSQLMigrations executes BEFORE it — a migration referencing them
+		// fails on a fresh database.
+		`ALTER TABLE dining_sessions ADD COLUMN IF NOT EXISTS guest_phone TEXT`,
+		`ALTER TABLE dining_sessions ADD COLUMN IF NOT EXISTS guest_email TEXT`,
+		`ALTER TABLE dining_sessions ADD COLUMN IF NOT EXISTS guest_gstin TEXT`,
+
+		// NULL is the normal case: an anonymous cash walk-in must not create a
+		// customer record, or the AR ledger fills with unusable rows.
+		`ALTER TABLE dining_sessions ADD COLUMN IF NOT EXISTS customer_id UUID REFERENCES accounting_customers(id) ON DELETE SET NULL`,
+		`ALTER TABLE bills ADD COLUMN IF NOT EXISTS customer_id UUID REFERENCES accounting_customers(id) ON DELETE SET NULL`,
+
+		// Phone is the upsert key for "is this the same customer?". Partial and
+		// per-tenant, so customers entered by hand with only a name are exempt.
+		`CREATE UNIQUE INDEX IF NOT EXISTS accounting_customers_hotel_phone_uniq
+			ON accounting_customers (hotel_id, phone)
+			WHERE phone IS NOT NULL AND phone <> ''`,
+		`CREATE INDEX IF NOT EXISTS accounting_customers_hotel_name_idx
+			ON accounting_customers (hotel_id, lower(name))`,
+		`CREATE INDEX IF NOT EXISTS bills_customer_idx ON bills (hotel_id, customer_id)`,
+		`CREATE INDEX IF NOT EXISTS dining_sessions_customer_idx ON dining_sessions (hotel_id, customer_id)`,
 	}
 	for _, statement := range statements {
 		if _, err := d.Pool.Exec(ctx, statement); err != nil {

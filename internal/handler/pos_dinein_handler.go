@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"math"
 	"strings"
 	"time"
@@ -259,6 +260,10 @@ func (h *POSHandler) OpenSession(c *fiber.Ctx) error {
 		GuestName    *string    `json:"guest_name"`
 		CustomerType string     `json:"customer_type"` // walk_in | hotel_guest
 		GuestStayID  *uuid.UUID `json:"guest_stay_id"` // set when charging to a room
+		// Optional contact capture. When a phone or email is supplied the
+		// session is linked to an accounting customer, so the sale shows up in
+		// the customer ledger and can be reviewed and edited from Accounting.
+		CustomerDetails
 	}
 	if err := c.BodyParser(&req); err != nil {
 		return response.Error(c, fiber.StatusBadRequest, "invalid request body")
@@ -288,12 +293,31 @@ func (h *POSHandler) OpenSession(c *fiber.Ctx) error {
 		return response.Error(c, fiber.StatusConflict, "table is not available")
 	}
 
+	// Resolve the accounting customer before opening the session. Anonymous
+	// walk-ins resolve to uuid.Nil and stay anonymous by design. A failure here
+	// must not block seating a table, so it is logged and the sale continues
+	// unlinked rather than being rejected.
+	details := req.CustomerDetails
+	if details.Name == "" && req.GuestName != nil {
+		details.Name = *req.GuestName
+	}
+	customerID, custErr := ensureAccountingCustomer(ctx, h.db(c), hotelID, details)
+	if custErr != nil {
+		log.Printf("pos: could not link accounting customer for table %s: %v", tableID, custErr)
+	}
+	var customerArg interface{}
+	if customerID != uuid.Nil {
+		customerArg = customerID
+	}
+
 	sessionNumber := genNumber("DIN")
 	var sessionID uuid.UUID
 	err = tx.QueryRow(ctx, `
-		INSERT INTO dining_sessions (hotel_id, session_number, table_id, outlet_id, covers, guest_name, customer_type, guest_stay_id, opened_by)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`,
-		hotelID, sessionNumber, tableID, tableOutlet, req.Covers, req.GuestName, req.CustomerType, req.GuestStayID, h.userID(c)).Scan(&sessionID)
+		INSERT INTO dining_sessions (hotel_id, session_number, table_id, outlet_id, covers, guest_name,
+			customer_type, guest_stay_id, opened_by, guest_phone, guest_email, guest_gstin, customer_id)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NULLIF($10,''),NULLIF($11,''),NULLIF($12,''),$13) RETURNING id`,
+		hotelID, sessionNumber, tableID, tableOutlet, req.Covers, req.GuestName, req.CustomerType,
+		req.GuestStayID, h.userID(c), details.Phone, details.Email, details.GSTIN, customerArg).Scan(&sessionID)
 	if err != nil {
 		return response.Error(c, fiber.StatusConflict, "table already has an active session")
 	}
@@ -307,6 +331,7 @@ func (h *POSHandler) OpenSession(c *fiber.Ctx) error {
 	return response.Created(c, map[string]interface{}{
 		"id": sessionID, "session_number": sessionNumber, "table_id": tableID,
 		"outlet_id": tableOutlet, "covers": req.Covers, "customer_type": req.CustomerType, "status": "open",
+		"customer_id": nilAsNull(customerID),
 	})
 }
 
@@ -1077,7 +1102,29 @@ func (h *POSHandler) AddBillPayment(c *fiber.Ctx) error {
 	// a ledger hiccup must never fail a completed sale (it can be reposted).
 	var journalID uuid.UUID
 	if newStatus == "paid" {
-		journalID, _ = postSalesToLedger(ctx, h.db(c), hotelID, req.Method, b.Subtotal, b.TaxAmount, b.TotalAmount, "BILL "+b.BillNumber, "POS sale — bill "+b.BillNumber)
+		// The customer captured when the table was seated, if any. A credit
+		// sale posts to Accounts Receivable against them instead of Cash/Bank.
+		var billCustomer uuid.UUID
+		_ = h.db(c).QueryRow(ctx,
+			`SELECT COALESCE(s.customer_id, '00000000-0000-0000-0000-000000000000'::uuid)
+			 FROM dining_sessions s WHERE s.id = $1`, b.SessionID).Scan(&billCustomer)
+		if billCustomer != uuid.Nil {
+			if _, err := h.db(c).Exec(ctx, `UPDATE bills SET customer_id=$1 WHERE id=$2`, billCustomer, id); err != nil {
+				log.Printf("pos: could not stamp customer on bill %s: %v", b.BillNumber, err)
+			}
+		}
+
+		var postErr error
+		journalID, postErr = postSalesToLedgerFor(ctx, h.db(c), hotelID, req.Method,
+			b.Subtotal, b.TaxAmount, b.TotalAmount, "BILL "+b.BillNumber,
+			"POS sale — bill "+b.BillNumber, billCustomer)
+		if postErr != nil {
+			// The sale is already committed and must not be undone, but a
+			// swallowed error here is how settled revenue silently goes
+			// missing from the ledger. Log it loudly so it can be reposted.
+			log.Printf("pos: LEDGER POST FAILED for bill %s (%.2f, %s): %v — sale stands, journal missing",
+				b.BillNumber, b.TotalAmount, req.Method, postErr)
+		}
 		// Phase 2: the inventory/COGS leg — Dr COGS, Cr Inventory using item cost.
 		// No-op until menu items carry a cost_price; never blocks the sale.
 		if cogs := sessionCOGS(ctx, h.db(c), b.SessionID); cogs > 0 {
