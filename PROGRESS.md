@@ -1,7 +1,7 @@
 # Serenentra — POS ⇄ Accounting Integration: Progress
 
 Living record of what has been built, what is deployed, and what remains.
-Last updated: 2026-08-05 (backfill completed).
+Last updated: 2026-08-05 (backfill completed; superadmin sign-in fixed).
 
 ---
 
@@ -9,12 +9,16 @@ Last updated: 2026-08-05 (backfill completed).
 
 | Repo | HEAD | GitHub | Production VM |
 |---|---|---|---|
-| `serenentra_golangserver` | `f2f1c62` | ✅ pushed | ✅ deployed, health 200 |
+| `serenentra_golangserver` | `f2f1c62` (code) | ✅ pushed | ✅ deployed, health 200 |
 | `HmsAdminStaffPortal` | `bba3f01` | ✅ pushed | ✅ deployed, `/admin` 200 |
-| `superadmin_serenentra` | `67488e1` | ✅ pushed | Vercel — see caveat below |
+| `superadmin_serenentra` | `f351fe7` | ✅ pushed | ✅ Vercel, login verified 200 |
 | `serenentra-landing` | unchanged | — | — |
 
 All five containers healthy: `api`, `portal`, `superadmin`, `postgres`, `redis`.
+
+`f2f1c62` is the last backend commit containing code; the commits after it on
+`serenentra_golangserver` are documentation and the audit copy of the backfill
+script, so the running binary is current with `main` despite the newer HEAD.
 
 The commits above are the last that changed deployed behaviour. Later
 documentation-only commits (including this file) ship no code and require no
@@ -151,7 +155,36 @@ Script committed verbatim as executed at
 `scripts/backfill_pos_orders_ledger.sql` — kept unmodified so the audit record
 matches exactly what was run against the books.
 
-### 5. Defects found and fixed along the way
+### 5. Superadmin console sign-in restored
+*(`f351fe7`, superadmin_serenentra)*
+
+Sign-in at https://superadmin.serenentra.com was failing for every user. The
+credentials were never at fault — the same account authenticated against the
+backend directly with 200:
+
+```
+direct backend  superadminportal.serenentra.com/api/auth/sign-in  -> 200 OK
+via Vercel      superadmin.serenentra.com/api/auth/sign-in        -> 404
+                                              DNS_HOSTNAME_RESOLVED_PRIVATE
+```
+
+The Nitro proxy fell back to `http://localhost:8787` when `API_BASE_URL` was
+unset, and on Vercel's edge localhost is a private address it refuses to proxy
+to. The build succeeded and pages rendered, which is exactly why the console
+looked healthy while being unusable — and why the failure pointed at DNS rather
+than at configuration.
+
+The default is now environment-aware: a Vercel build defaults to the real
+backend, local development still defaults to localhost, and `API_BASE_URL`
+remains an override for pointing at a different backend. This removes a hidden
+operational requirement — the console previously depended on a dashboard setting
+that nothing in the repo enforced or documented.
+
+Verified live: sign-in through the website returns 200. The local-dev and
+override-set paths follow from the same expression but were not separately
+exercised.
+
+### 6. Defects found and fixed along the way
 
 - **Silently swallowed ledger errors.** The posting call was `journalID, _ =`,
   so a failure left a completed sale with no journal entry and no trace. Now
@@ -258,26 +291,16 @@ key to match an accounting customer on. Contact capture lives on the dine-in
 path, which has the fields. Closing this means adding customer columns to
 `pos_orders` — worth doing only if that screen is staying long-term.
 
-### Superadmin: `API_BASE_URL` unverified
-Commit `67488e1` changed the Nitro proxy from a hardcoded URL to an env var. If
-`API_BASE_URL` is **not** set in the Vercel project, the build succeeds and
-production then proxies to `localhost:8787` and cannot reach the API. The Vercel
-CLI could not be authenticated from this environment to confirm.
-**Action: set `API_BASE_URL=https://superadminportal.serenentra.com` under
-serenentraportal → Settings → Environment Variables.**
-
 ---
 
 ## Suggested next steps, in order
 
-1. **Verify the Vercel env var** above — smallest action, largest downside if
-   wrong.
-2. **P&L + Balance Sheet endpoints** — pure aggregation over data that already
+1. **P&L + Balance Sheet endpoints** — pure aggregation over data that already
    exists; no schema change, high visible value.
-3. **Folio charges post on accrual** — closes the largest correctness gap; makes
+2. **Folio charges post on accrual** — closes the largest correctness gap; makes
    the system genuinely accrual rather than mixed.
-4. **Fiscal period locking** — make night audit seal the ledger.
-5. **Inventory / expense / payroll posting** — each needs its own debit/credit
+3. **Fiscal period locking** — make night audit seal the ledger.
+4. **Inventory / expense / payroll posting** — each needs its own debit/credit
    design; largest remaining chunk.
 
 ---
@@ -312,6 +335,11 @@ serenentraportal → Settings → Environment Variables.**
   `CURRENT_DATE`, so any historical posting driven through the API lands in the
   wrong period. Historical corrections need direct SQL, in a transaction, with a
   balance guard and an idempotency key on the reference.
+- **A deploy must not depend on an unset env var to be usable.** The superadmin
+  console fell back to `localhost:8787` when `API_BASE_URL` was missing; on
+  Vercel that is a private address the edge refuses, so every API call 404'd
+  while the build and the pages looked fine. Defaults for production builds
+  should point at production. Treat env vars as overrides, not requirements.
 - **Rehearse financial writes with `ROLLBACK`.** Running the exact script with
   `COMMIT` swapped for `ROLLBACK` shows every posting and exercises the balance
   guard without persisting anything.
