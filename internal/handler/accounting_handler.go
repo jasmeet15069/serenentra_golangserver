@@ -1742,7 +1742,8 @@ type journalEntryReq struct {
 
 func (h *AccountingHandler) ListJournalEntries(c *fiber.Ctx) error {
 	rows, err := tenantPool(c, h.pool).Query(c.Context(),
-		`SELECT id, entry_date, description, COALESCE(reference,''), created_at
+		`SELECT id, entry_date, description, COALESCE(reference,''),
+		        COALESCE(voucher_no,''), COALESCE(voucher_type,''), created_at
 		 FROM accounting_journal_entries WHERE hotel_id = $1 ORDER BY entry_date DESC, created_at DESC`, h.hotelID(c))
 	if err != nil {
 		return response.Error(c, 500, err.Error())
@@ -1753,13 +1754,16 @@ func (h *AccountingHandler) ListJournalEntries(c *fiber.Ctx) error {
 		Date        string    `json:"date"`
 		Description string    `json:"description"`
 		Reference   string    `json:"reference"`
+		VoucherNo   string    `json:"voucher_no"`
+		VoucherType string    `json:"voucher_type"`
 		CreatedAt   time.Time `json:"created_at"`
 	}
 	out := []je{}
 	for rows.Next() {
 		var r je
 		var d time.Time
-		if err := rows.Scan(&r.ID, &d, &r.Description, &r.Reference, &r.CreatedAt); err != nil {
+		if err := rows.Scan(&r.ID, &d, &r.Description, &r.Reference,
+			&r.VoucherNo, &r.VoucherType, &r.CreatedAt); err != nil {
 			return response.Error(c, 500, err.Error())
 		}
 		r.Date = d.Format("2006-01-02")

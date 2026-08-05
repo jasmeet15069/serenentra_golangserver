@@ -736,6 +736,29 @@ func (d *DB) EnsureAppSchema(ctx context.Context) error {
 			created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
 
+		// --- Voucher numbering (D365-style) ---
+		//
+		// Every GL posting gets a numbered voucher of a known type. D365 numbers
+		// by journal type and that numbering is an audit and statutory
+		// requirement, not cosmetic: "which document produced this entry" must be
+		// answerable from the ledger alone. Previously an entry carried only a
+		// free-text description and reference.
+		`ALTER TABLE accounting_journal_entries ADD COLUMN IF NOT EXISTS voucher_no TEXT`,
+		`ALTER TABLE accounting_journal_entries ADD COLUMN IF NOT EXISTS voucher_type TEXT`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS accounting_journal_voucher_uniq
+			ON accounting_journal_entries (hotel_id, voucher_no)
+			WHERE voucher_no IS NOT NULL`,
+
+		// Per-tenant, per-type counter. A dedicated table makes allocation a
+		// single atomic UPSERT, so two concurrent tills cannot be handed the
+		// same number - which MAX(voucher_no)+1 would allow.
+		`CREATE TABLE IF NOT EXISTS accounting_voucher_counters (
+			hotel_id UUID NOT NULL REFERENCES hotels(id) ON DELETE CASCADE,
+			voucher_type TEXT NOT NULL,
+			next_no BIGINT NOT NULL DEFAULT 1,
+			PRIMARY KEY (hotel_id, voucher_type)
+		)`,
+
 		// --- POS dine-in <-> accounting customer link ---
 		//
 		// A dine-in session previously carried only a free-text guest_name, and

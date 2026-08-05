@@ -107,3 +107,28 @@ func TestNormalisedTrimsAndCases(t *testing.T) {
 		t.Errorf("gstin = %q, want uppercased", d.GSTIN)
 	}
 }
+
+// The voucher type is derived from the reference prefix, so every existing
+// posting site gains a correctly-typed voucher without being modified. A wrong
+// mapping would file a sale under purchases in the audit trail.
+func TestVoucherTypeFor(t *testing.T) {
+	cases := map[string]string{
+		"BILL BILL-20260805-1": "SAL",
+		"ORDER ORD-20260805-2": "SAL",
+		"INV INV-0001":         "SAL",
+		"FOLIO F-77":           "SAL",
+		"GRN GRN-0001":         "PUR",
+		"PO PO-0001":           "PUR",
+		"DN DN-0001":           "PUR",
+		"VP VP-0001":           "PAY",
+		"PAY PAY-0001":         "PAY",
+		"COGS — bill BILL-1":   "GEN",
+		"":                     "GEN",
+		"something unexpected": "GEN",
+	}
+	for ref, want := range cases {
+		if got := voucherTypeFor(ref); got != want {
+			t.Errorf("voucherTypeFor(%q) = %q, want %q", ref, got, want)
+		}
+	}
+}

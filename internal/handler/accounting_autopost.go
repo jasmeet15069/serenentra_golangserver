@@ -2,6 +2,9 @@ package handler
 
 import (
 	"context"
+	"fmt"
+	"log"
+	"strings"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -77,11 +80,22 @@ func postJournal(ctx context.Context, pool *pgxpool.Pool, hotelID uuid.UUID, des
 	if err != nil {
 		return uuid.Nil, err
 	}
+	// Every posting flows through here, so numbering the voucher at this one
+	// chokepoint gives all callers a voucher without touching any of them.
+	vType := voucherTypeFor(reference)
+	voucherNo, vErr := nextVoucherNo(ctx, pool, hotelID, vType)
+	if vErr != nil {
+		// A numbering failure must not lose the entry: the ledger still has to
+		// balance. Post unnumbered and log, rather than dropping the sale.
+		log.Printf("accounting: voucher numbering failed for %s (%s): %v — posting unnumbered",
+			reference, vType, vErr)
+	}
+
 	entryID := uuid.New()
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO accounting_journal_entries (id, hotel_id, entry_date, description, reference, created_at)
-		VALUES ($1,$2,CURRENT_DATE,$3,$4,now())`,
-		entryID, hotelID, description, reference); err != nil {
+		INSERT INTO accounting_journal_entries (id, hotel_id, entry_date, description, reference, voucher_no, voucher_type, created_at)
+		VALUES ($1,$2,CURRENT_DATE,$3,$4,NULLIF($5,''),$6,now())`,
+		entryID, hotelID, description, reference, voucherNo, vType); err != nil {
 		return uuid.Nil, err
 	}
 	for _, l := range lines {
@@ -267,4 +281,55 @@ func postVendorDebitNote(ctx context.Context, pool *pgxpool.Pool, hotelID uuid.U
 		{accountCode: "2000", debit: round2(total), memo: "Payable reduced"},
 		{accountCode: "1400", credit: round2(total), memo: "Goods returned"},
 	})
+}
+
+// --- Voucher numbering ------------------------------------------------------
+//
+// D365 F&O numbers every GL posting by journal type. That numbering is an audit
+// requirement: given a ledger line you must be able to name the document that
+// produced it. Entries previously carried only a free-text description and
+// reference, so there was no stable identifier to cite.
+//
+// The type is derived from the reference prefix rather than threaded through
+// every posting site, so all existing callers gain vouchers without change and
+// no call site can forget to supply one.
+
+// voucherTypeFor maps a posting reference onto its journal type.
+//
+//	SAL  sales      revenue in  (POS bills, legacy orders, room folios, AR invoices)
+//	PUR  purchase   goods in    (GRN, vendor debit notes)
+//	PAY  payment    cash out    (vendor/AP settlement)
+//	GEN  general    anything else, including COGS and manual entries
+func voucherTypeFor(reference string) string {
+	switch {
+	case strings.HasPrefix(reference, "BILL "), strings.HasPrefix(reference, "ORDER "),
+		strings.HasPrefix(reference, "INV "), strings.HasPrefix(reference, "FOLIO "):
+		return "SAL"
+	case strings.HasPrefix(reference, "GRN "), strings.HasPrefix(reference, "PO "),
+		strings.HasPrefix(reference, "DN "):
+		return "PUR"
+	case strings.HasPrefix(reference, "VP "), strings.HasPrefix(reference, "PAY "):
+		return "PAY"
+	default:
+		return "GEN"
+	}
+}
+
+// nextVoucherNo allocates the next number for a tenant and type.
+//
+// Allocation is a single atomic UPSERT against a counter row. MAX(voucher_no)+1
+// would let two concurrent tills read the same maximum and be handed the same
+// number, which a unique index would then reject - losing one of the sales.
+func nextVoucherNo(ctx context.Context, pool *pgxpool.Pool, hotelID uuid.UUID, vType string) (string, error) {
+	var n int64
+	err := pool.QueryRow(ctx, `
+		INSERT INTO accounting_voucher_counters (hotel_id, voucher_type, next_no)
+		VALUES ($1,$2,2)
+		ON CONFLICT (hotel_id, voucher_type)
+		DO UPDATE SET next_no = accounting_voucher_counters.next_no + 1
+		RETURNING next_no - 1`, hotelID, vType).Scan(&n)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%s-%06d", vType, n), nil
 }
