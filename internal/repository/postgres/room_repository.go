@@ -179,10 +179,20 @@ func (r *roomRepository) DeleteRoom(ctx context.Context, hotelID, id uuid.UUID) 
 	return err
 }
 
+// UpdateRoomStatus returns ErrNotFound when no room matches, so a caller that
+// cares can answer 404 instead of reporting success for a room that does not
+// exist (or belongs to another tenant). Callers that update a room they already
+// resolved may keep discarding the error.
 func (r *roomRepository) UpdateRoomStatus(ctx context.Context, hotelID, id uuid.UUID, status domain.RoomStatus) error {
 	const q = `UPDATE rooms SET status = $1, updated_at = $2 WHERE hotel_id = $3 AND id = $4`
-	_, err := poolFromContext(ctx, r.db.Pool).Exec(ctx, q, status, time.Now().UTC(), hotelID, id)
-	return err
+	tag, err := poolFromContext(ctx, r.db.Pool).Exec(ctx, q, status, time.Now().UTC(), hotelID, id)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 // Guest Stays
@@ -288,8 +298,16 @@ func (r *roomRepository) UpdateStay(ctx context.Context, hotelID, id uuid.UUID, 
 	args = append(args, id)
 	args = append(args, hotelID)
 	q := fmt.Sprintf("UPDATE guest_stays SET %s WHERE id = $%d AND hotel_id = $%d", setClauses, i, i+1)
-	_, err := poolFromContext(ctx, r.db.Pool).Exec(ctx, q, args...)
-	return err
+	tag, err := poolFromContext(ctx, r.db.Pool).Exec(ctx, q, args...)
+	if err != nil {
+		return err
+	}
+	// No matching stay: the id is unknown or belongs to another tenant. Report
+	// it rather than letting the caller treat a zero-row update as a success.
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 func (r *roomRepository) DeleteStay(ctx context.Context, hotelID, id uuid.UUID) error {

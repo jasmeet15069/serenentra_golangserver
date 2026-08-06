@@ -2,6 +2,8 @@ package handler
 
 import (
 	"encoding/json"
+	"errors"
+	"strings"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
@@ -135,7 +137,15 @@ func (h *RoomHandler) UpdateStatus(c *fiber.Ctx) error {
 	if err := c.BodyParser(&req); err != nil {
 		return response.Error(c, fiber.StatusBadRequest, "invalid request body")
 	}
-	if err := h.rooms.UpdateRoomStatus(c.Context(), tenantHotelID(c), id, domain.RoomStatus(req.Status)); err != nil {
+	status := domain.RoomStatus(req.Status)
+	if !status.Valid() {
+		return response.Error(c, fiber.StatusBadRequest,
+			"invalid status, expected one of: "+strings.Join(domain.RoomStatusValues(), ", "))
+	}
+	if err := h.rooms.UpdateRoomStatus(c.Context(), tenantHotelID(c), id, status); err != nil {
+		if errors.Is(err, postgres.ErrNotFound) {
+			return response.Error(c, fiber.StatusNotFound, "room not found")
+		}
 		return response.Error(c, fiber.StatusBadRequest, err.Error())
 	}
 	h.invalidateRooms(c)

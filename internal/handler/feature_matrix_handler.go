@@ -68,6 +68,9 @@ func (h *OperationsHandler) PlatformTenantFeatureMatrix(c *fiber.Ctx) error {
 	if err != nil {
 		return response.Error(c, fiber.StatusBadRequest, "invalid tenant id")
 	}
+	if !h.requireTenant(c, id) {
+		return nil
+	}
 	deny, err := h.loadDenySet(c, id)
 	if err != nil {
 		return response.Error(c, fiber.StatusInternalServerError, "failed to load feature matrix")
@@ -97,6 +100,9 @@ func (h *OperationsHandler) UpdatePlatformTenantFeatureMatrix(c *fiber.Ctx) erro
 	id, err := uuid.Parse(c.Params("id"))
 	if err != nil {
 		return response.Error(c, fiber.StatusBadRequest, "invalid tenant id")
+	}
+	if !h.requireTenant(c, id) {
+		return nil
 	}
 	var req featureMatrixUpdateRequest
 	if err := c.BodyParser(&req); err != nil {

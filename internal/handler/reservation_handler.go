@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -279,6 +280,9 @@ func (h *ReservationHandler) Update(c *fiber.Ctx) error {
 		return response.Error(c, fiber.StatusBadRequest, "no fields to update")
 	}
 	if err := h.roomRepo.UpdateStay(c.Context(), hotelID, id, fields); err != nil {
+		if errors.Is(err, postgres.ErrNotFound) {
+			return response.Error(c, fiber.StatusNotFound, "reservation not found")
+		}
 		return response.Error(c, fiber.StatusInternalServerError, "update failed")
 	}
 	stay, _ := h.roomRepo.FindStayByID(c.Context(), hotelID, id)
@@ -314,6 +318,9 @@ func (h *ReservationHandler) CheckIn(c *fiber.Ctx) error {
 	}
 	now := time.Now().UTC()
 	if err := h.roomRepo.UpdateStay(c.Context(), tenantHotelID(c), id, map[string]interface{}{"actual_check_in": now}); err != nil {
+		if errors.Is(err, postgres.ErrNotFound) {
+			return response.Error(c, fiber.StatusNotFound, "reservation not found")
+		}
 		return response.Error(c, fiber.StatusInternalServerError, "check-in failed")
 	}
 
@@ -356,6 +363,9 @@ func (h *ReservationHandler) CheckOut(c *fiber.Ctx) error {
 	}
 	now := time.Now().UTC()
 	if err := h.roomRepo.UpdateStay(c.Context(), tenantHotelID(c), id, map[string]interface{}{"actual_check_out": now}); err != nil {
+		if errors.Is(err, postgres.ErrNotFound) {
+			return response.Error(c, fiber.StatusNotFound, "reservation not found")
+		}
 		return response.Error(c, fiber.StatusInternalServerError, "check-out failed")
 	}
 

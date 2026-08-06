@@ -1025,3 +1025,27 @@ func (h *OperationsHandler) requirePlatformAdmin(c *fiber.Ctx) bool {
 	_ = response.Error(c, fiber.StatusForbidden, "platform admin role is required")
 	return false
 }
+
+// requireTenant confirms :id names a real tenant, answering 404 itself when it
+// does not. Follows requirePlatformAdmin's shape so a handler guards with two
+// lines.
+//
+// `hotels` is the authority, not `tenant_registry`: a tenant exists there from
+// creation, while its registry row is written later by provisioning. Keying on
+// the registry would 404 a freshly created tenant.
+//
+// Without this, an unknown id does not fail — it falls through to whatever the
+// handler's defaults are, and the operation "succeeds" against the wrong thing.
+func (h *OperationsHandler) requireTenant(c *fiber.Ctx, id uuid.UUID) bool {
+	var exists bool
+	if err := h.pool.QueryRow(c.Context(),
+		`SELECT EXISTS (SELECT 1 FROM hotels WHERE id = $1)`, id).Scan(&exists); err != nil {
+		_ = response.Error(c, fiber.StatusInternalServerError, "failed to look up tenant")
+		return false
+	}
+	if !exists {
+		_ = response.Error(c, fiber.StatusNotFound, "tenant not found")
+		return false
+	}
+	return true
+}

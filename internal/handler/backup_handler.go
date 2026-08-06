@@ -215,6 +215,12 @@ func (h *OperationsHandler) RunPlatformTenantBackup(c *fiber.Ctx) error {
 	if err != nil {
 		return response.Error(c, fiber.StatusBadRequest, "invalid tenant id")
 	}
+	// Must precede resolveBackupDSN: an unknown tenant has no registry row, so
+	// the resolver falls back to the shared DSN and this would dump the whole
+	// platform database into a file named after a tenant that does not exist.
+	if !h.requireTenant(c, id) {
+		return nil
+	}
 
 	ctx, cancel := context.WithTimeout(c.Context(), 5*time.Minute)
 	defer cancel()
@@ -262,6 +268,9 @@ func (h *OperationsHandler) RunPlatformTenantRedisBackup(c *fiber.Ctx) error {
 	id, err := uuid.Parse(c.Params("id"))
 	if err != nil {
 		return response.Error(c, fiber.StatusBadRequest, "invalid tenant id")
+	}
+	if !h.requireTenant(c, id) {
+		return nil
 	}
 	if h.cache == nil {
 		return response.Error(c, fiber.StatusServiceUnavailable, "redis backup not available: cache not configured")

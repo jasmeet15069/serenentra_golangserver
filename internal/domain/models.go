@@ -19,6 +19,26 @@ const (
 	RoomStatusMaintenance RoomStatus = "maintenance"
 )
 
+// Valid reports whether s is one of the four known room statuses. The column
+// has no CHECK constraint, so without this an arbitrary string reaches the
+// database and every screen that switches on status mis-renders the room from
+// then on.
+func (s RoomStatus) Valid() bool {
+	switch s {
+	case RoomStatusAvailable, RoomStatusOccupied, RoomStatusCleaning, RoomStatusMaintenance:
+		return true
+	}
+	return false
+}
+
+// RoomStatusValues lists the accepted statuses, for error messages.
+func RoomStatusValues() []string {
+	return []string{
+		string(RoomStatusAvailable), string(RoomStatusOccupied),
+		string(RoomStatusCleaning), string(RoomStatusMaintenance),
+	}
+}
+
 type OrderStatus string
 
 const (

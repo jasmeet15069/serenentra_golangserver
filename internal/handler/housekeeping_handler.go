@@ -226,9 +226,12 @@ func (h *HousekeepingHandler) UpdateTask(c *fiber.Ctx) error {
 		"UPDATE housekeeping_assignments SET %s WHERE id = $%d AND hotel_id = $%d",
 		setClauses, argIdx, argIdx+1,
 	)
-	_, err = tenantPool(c, h.pool).Exec(c.Context(), q, args...)
+	tag, err := tenantPool(c, h.pool).Exec(c.Context(), q, args...)
 	if err != nil {
 		return response.Error(c, fiber.StatusBadRequest, err.Error())
+	}
+	if tag.RowsAffected() == 0 {
+		return response.Error(c, fiber.StatusNotFound, "task not found")
 	}
 	return response.OK(c, map[string]string{"status": "updated"})
 }
