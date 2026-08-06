@@ -37,6 +37,7 @@ type Handlers struct {
 	Accounting     *AccountingHandler
 	Demo           *DemoHandler
 	Newsletter     *NewsletterHandler
+	ChannelIngest  *ChannelIngestHandler
 }
 
 func Register(app *fiber.App, h Handlers, secret string, pool *pgxpool.Pool, c cache.Cache, tenantMgr *tenant.Manager) {
@@ -235,6 +236,18 @@ func Register(app *fiber.App, h Handlers, secret string, pool *pgxpool.Pool, c c
 	}
 	if h.Newsletter != nil {
 		h.Newsletter.Register(api)
+	}
+	if h.ChannelIngest != nil {
+		// MUST stay in this public block. OTAs (Booking.com, Agoda, OYO,
+		// MakeMyTrip, Expedia) push reservations with no staff session and no
+		// bearer token, so a webhook registered after api.Use(authGate) below
+		// would 401 every delivery — and an OTA treats 401 as retryable, so it
+		// would retry forever while nothing was ever booked.
+		//
+		// It is not unauthenticated: the URL names a channel_connection and the
+		// body is HMAC-signed with that connection's api_key, checked in
+		// constant time before anything is read.
+		h.ChannelIngest.Register(api)
 	}
 
 	// --- Staff-only auth gate. Every handler registered below requires a valid

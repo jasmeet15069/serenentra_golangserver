@@ -128,6 +128,7 @@ func main() {
 		Compat:         handler.NewCompatHandler(db.Pool, cfg),
 		Users:          userHandler,
 		Reservations:   reservationHandler,
+		ChannelIngest:  handler.NewChannelIngestHandler(db.Pool, db, roomRepo),
 		Billing:        handler.NewBillingHandler(db.Pool, emailSvc, cfg.Auth.AccessTokenSecret),
 		Housekeeping:   handler.NewHousekeepingHandler(db.Pool),
 		Revenue:        handler.NewRevenueHandler(db.Pool),

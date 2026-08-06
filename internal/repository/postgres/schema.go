@@ -833,6 +833,32 @@ func (d *DB) EnsureAppSchema(ctx context.Context) error {
 			ON reservation_documents (hotel_id, guest_stay_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_reservation_documents_guest
 			ON reservation_documents (hotel_id, guest_id)`,
+
+		// Inbound OTA and booking-engine reservations (Booking.com, Agoda, OYO,
+		// MakeMyTrip, a client's own website). The raw payload is stored before
+		// anything is interpreted, so a delivery is never lost to a mapping bug
+		// and a failed one can be replayed once the mapping is fixed.
+		`CREATE TABLE IF NOT EXISTS channel_bookings (
+			id            UUID PRIMARY KEY,
+			hotel_id      UUID NOT NULL REFERENCES hotels(id) ON DELETE CASCADE,
+			connection_id UUID REFERENCES channel_connections(id) ON DELETE SET NULL,
+			channel_name  TEXT NOT NULL,
+			external_ref  TEXT NOT NULL,
+			payload       JSONB NOT NULL,
+			status        TEXT NOT NULL DEFAULT 'received',
+			guest_stay_id UUID REFERENCES guest_stays(id) ON DELETE SET NULL,
+			commission    NUMERIC(12,2) NOT NULL DEFAULT 0,
+			error         TEXT,
+			received_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+			processed_at  TIMESTAMPTZ
+		)`,
+		// The idempotency guarantee. OTAs redeliver on any timeout or non-2xx,
+		// so without this one guest arriving once would become several
+		// reservations holding several rooms.
+		`CREATE UNIQUE INDEX IF NOT EXISTS channel_bookings_external_key
+			ON channel_bookings (hotel_id, channel_name, external_ref)`,
+		`CREATE INDEX IF NOT EXISTS channel_bookings_hotel_status
+			ON channel_bookings (hotel_id, status, received_at DESC)`,
 	}
 	for _, statement := range statements {
 		if _, err := d.Pool.Exec(ctx, statement); err != nil {
