@@ -19,8 +19,9 @@ import (
 	"github.com/hotelharmony/api/pkg/response"
 )
 
-// backupDir is where dump artifacts are written. It is a host-mounted volume so
-// backups survive container restarts (see docker-compose.prod.yml).
+// backupDir is where dump artifacts are written. Both compose files mount the
+// `backups` named volume here so artifacts outlive the container; if that mount
+// is ever dropped, every deploy silently destroys every backup taken so far.
 const backupDir = "/app/backups"
 
 // Backup configuration superadmin endpoints (Phase 4 slice one). These persist a
@@ -335,15 +336,20 @@ func (h *OperationsHandler) DownloadPlatformTenantBackup(c *fiber.Ctx) error {
 }
 
 type backupJob struct {
-	ID         string  `json:"id"`
-	Kind       string  `json:"kind"`
-	Status     string  `json:"status"`
-	Trigger    string  `json:"trigger"`
-	DBName     string  `json:"db_name"`
-	Bytes      int64   `json:"bytes"`
-	Error      *string `json:"error"`
-	StartedAt  string  `json:"started_at"`
-	FinishedAt *string `json:"finished_at"`
+	ID      string  `json:"id"`
+	Kind    string  `json:"kind"`
+	Status  string  `json:"status"`
+	Trigger string  `json:"trigger"`
+	DBName  string  `json:"db_name"`
+	Bytes   int64   `json:"bytes"`
+	Error   *string `json:"error"`
+	// ArtifactAvailable reports whether the file is still on disk. A job stays
+	// 'success' forever, but the artifact can be gone — anything written before
+	// the backups volume existed was destroyed when its container was replaced.
+	// Without this the console offers a download that can only fail.
+	ArtifactAvailable bool    `json:"artifact_available"`
+	StartedAt         string  `json:"started_at"`
+	FinishedAt        *string `json:"finished_at"`
 }
 
 // PlatformTenantBackupHistory (GET /api/platform/tenants/:id/backup/history)
@@ -359,6 +365,7 @@ func (h *OperationsHandler) PlatformTenantBackupHistory(c *fiber.Ctx) error {
 	jobs := []backupJob{}
 	rows, err := h.pool.Query(c.Context(),
 		`SELECT id, COALESCE(kind,'postgres'), status, trigger, COALESCE(db_name,''), bytes, error,
+		        COALESCE(file_path,''),
 		        to_char(started_at, 'YYYY-MM-DD HH24:MI'),
 		        to_char(finished_at, 'YYYY-MM-DD HH24:MI')
 		 FROM backup_jobs WHERE hotel_id = $1 ORDER BY started_at DESC LIMIT 20`, id)
@@ -366,7 +373,12 @@ func (h *OperationsHandler) PlatformTenantBackupHistory(c *fiber.Ctx) error {
 		defer rows.Close()
 		for rows.Next() {
 			var j backupJob
-			if err := rows.Scan(&j.ID, &j.Kind, &j.Status, &j.Trigger, &j.DBName, &j.Bytes, &j.Error, &j.StartedAt, &j.FinishedAt); err == nil {
+			var fpath string
+			if err := rows.Scan(&j.ID, &j.Kind, &j.Status, &j.Trigger, &j.DBName, &j.Bytes, &j.Error, &fpath, &j.StartedAt, &j.FinishedAt); err == nil {
+				if fpath != "" && j.Status == "success" {
+					_, statErr := os.Stat(fpath)
+					j.ArtifactAvailable = statErr == nil
+				}
 				jobs = append(jobs, j)
 			}
 		}

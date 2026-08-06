@@ -28,9 +28,17 @@ services:
       HTTP_PORT: 8787
     ports:
       - "8787:8787"
+    # Backup artifacts are written to /app/backups by the platform backup
+    # endpoints. Without this volume they live in the container's writable
+    # layer, so every deploy recreates the container and silently destroys
+    # every backup ever taken, while backup_jobs still reports them as
+    # successful and downloadable.
+    volumes:
+      - backups:/app/backups
     depends_on:
       - postgres
       - redis
 
 volumes:
   pgdata:
+  backups:

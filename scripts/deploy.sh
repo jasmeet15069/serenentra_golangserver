@@ -40,10 +40,18 @@ echo "==> local checks"
 ( cd "$root" && go build ./... && go vet ./... && bash scripts/check_migrations.sh )
 
 # 2. Package exactly the paths the container build needs (no .env, no .git).
+#
+# `deployments` is included so Dockerfile and compose changes actually reach the
+# VM. It was left out originally, which meant infrastructure edits appeared to
+# deploy — the script ran clean and the container restarted — while the VM kept
+# its old compose file. A missing backups volume survived that way.
+#
+# The consequence is that the repo copy overwrites the VM copy, so the two must
+# not drift. If you change compose on the VM, mirror it here in the same change.
 stamp="$(date +%Y%m%d-%H%M%S)"
 tarball="/tmp/golangserver-${stamp}.tar.gz"
 echo "==> packaging $tarball"
-( cd "$root" && tar -czf "$tarball" cmd internal pkg migrations go.mod go.sum )
+( cd "$root" && tar -czf "$tarball" cmd internal pkg migrations deployments go.mod go.sum )
 
 if [ "$DRY_RUN" = "1" ]; then
   echo "DRY_RUN=1 — built + packaged only; nothing shipped."
@@ -59,7 +67,7 @@ remote_tar="/tmp/$(basename "$tarball")"
 echo "==> remote build + up"
 ssh $SSH_OPTS "$VM_HOST" "set -e
   mkdir -p /tmp/deploy-backup-${stamp}
-  (cd '$REMOTE_DIR' && tar -czf /tmp/deploy-backup-${stamp}/golangserver-src.tar.gz cmd internal pkg migrations go.mod go.sum)
+  (cd '$REMOTE_DIR' && tar -czf /tmp/deploy-backup-${stamp}/golangserver-src.tar.gz cmd internal pkg migrations deployments go.mod go.sum)
   tar -xzf '$remote_tar' -C '$REMOTE_DIR'
   cd '$COMPOSE_DIR'
   docker compose --env-file '$REMOTE_DIR/.env' -f '$COMPOSE_FILE' build api
