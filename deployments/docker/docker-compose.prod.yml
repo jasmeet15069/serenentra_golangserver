@@ -45,8 +45,15 @@ services:
     # Platform backup artifacts. Without this they sit in the container's
     # writable layer and every deploy destroys them, while backup_jobs goes on
     # reporting them as successful and downloadable.
+    #
+    # uploads holds guest identity documents, and needs a volume for exactly the
+    # same reason — with one worse consequence. A lost backup is recoverable by
+    # taking another; a lost passport scan is a compliance record that cannot be
+    # reconstructed, while reservation_documents goes on claiming the file is
+    # there. This MUST ship in the same deploy as the upload code.
     volumes:
       - backups:/app/backups
+      - uploads:/app/uploads
     depends_on:
       postgres:
         condition: service_healthy
@@ -113,3 +120,4 @@ volumes:
   pgdata:
   redisdata:
   backups:
+  uploads:

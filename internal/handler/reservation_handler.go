@@ -92,6 +92,7 @@ func (h *ReservationHandler) Register(r fiber.Router) {
 	r.Delete("/reservations/:id", h.Cancel)
 	r.Post("/reservations/:id/checkin", h.CheckIn)
 	r.Post("/reservations/:id/checkout", h.CheckOut)
+	h.registerDocumentRoutes(r)
 }
 
 func (h *ReservationHandler) List(c *fiber.Ctx) error {

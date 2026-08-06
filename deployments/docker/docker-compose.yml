@@ -35,6 +35,7 @@ services:
     # successful and downloadable.
     volumes:
       - backups:/app/backups
+      - uploads:/app/uploads
     depends_on:
       - postgres
       - redis
@@ -42,3 +43,4 @@ services:
 volumes:
   pgdata:
   backups:
+  uploads:
