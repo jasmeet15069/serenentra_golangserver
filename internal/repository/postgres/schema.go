@@ -789,6 +789,50 @@ func (d *DB) EnsureAppSchema(ctx context.Context) error {
 			ON accounting_customers (hotel_id, lower(name))`,
 		`CREATE INDEX IF NOT EXISTS bills_customer_idx ON bills (hotel_id, customer_id)`,
 		`CREATE INDEX IF NOT EXISTS dining_sessions_customer_idx ON dining_sessions (hotel_id, customer_id)`,
+
+		// --- Front-office reservation module ---------------------------------
+		//
+		// Here rather than in migrations/ for the same reason as the block above:
+		// guests and promotions are created by this statement list, so a
+		// migration referencing them fails on a fresh database. The parts that
+		// touch only guest_stays, payments and folios are in
+		// migrations/027_reservation_lifecycle.sql.
+
+		// guests had no index at all beyond its primary key, and EnsureGuest
+		// runs on every booking and every check-in.
+		`CREATE INDEX IF NOT EXISTS idx_guests_hotel ON guests (hotel_id)`,
+
+		// EnsureGuest matches on the last ten digits of the phone, so the index
+		// has to be on that same expression or the planner cannot use it and
+		// every lookup is a sequential scan. Kept character-for-character
+		// identical to the query in roomRepository.EnsureGuest.
+		`CREATE INDEX IF NOT EXISTS idx_guests_hotel_phone_last10
+			ON guests (hotel_id, right(regexp_replace(COALESCE(phone,''), '\D', '', 'g'), 10))`,
+		`CREATE INDEX IF NOT EXISTS idx_guests_hotel_email
+			ON guests (hotel_id, lower(email)) WHERE email IS NOT NULL AND email <> ''`,
+
+		// Identity documents captured at the desk. Bytes live on the uploads
+		// volume; only metadata is stored here. Deliberately no ON DELETE
+		// CASCADE from guests: a document outlives the CRM record it was
+		// captured against, and losing the audit trail is worse than an orphan.
+		`CREATE TABLE IF NOT EXISTS reservation_documents (
+			id            UUID PRIMARY KEY,
+			hotel_id      UUID NOT NULL REFERENCES hotels(id) ON DELETE CASCADE,
+			guest_stay_id UUID REFERENCES guest_stays(id) ON DELETE CASCADE,
+			guest_id      UUID REFERENCES guests(id) ON DELETE SET NULL,
+			doc_type      TEXT NOT NULL,
+			doc_number    TEXT,
+			file_path     TEXT NOT NULL,
+			mime_type     TEXT NOT NULL,
+			size_bytes    BIGINT NOT NULL,
+			sha256        TEXT NOT NULL,
+			uploaded_by   UUID REFERENCES users(id) ON DELETE SET NULL,
+			created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_reservation_documents_stay
+			ON reservation_documents (hotel_id, guest_stay_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_reservation_documents_guest
+			ON reservation_documents (hotel_id, guest_id)`,
 	}
 	for _, statement := range statements {
 		if _, err := d.Pool.Exec(ctx, statement); err != nil {

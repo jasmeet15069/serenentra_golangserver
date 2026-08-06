@@ -9,7 +9,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/hotelharmony/api/internal/repository/postgres"
 )
 
 // Customer linkage between POS dine-in and the accounting customer master.
@@ -73,7 +73,7 @@ func normalisePhone(raw string) string {
 // Matching is by phone, the natural key staff have at the table. Returns
 // (uuid.Nil, nil) when there is nothing worth recording — the caller treats
 // that as an anonymous sale, not an error.
-func ensureAccountingCustomer(ctx context.Context, pool *pgxpool.Pool, hotelID uuid.UUID, in CustomerDetails) (uuid.UUID, error) {
+func ensureAccountingCustomer(ctx context.Context, pool postgres.Querier, hotelID uuid.UUID, in CustomerDetails) (uuid.UUID, error) {
 	d := in.normalised()
 	if !d.HasContact() {
 		return uuid.Nil, nil
@@ -128,7 +128,7 @@ func ensureAccountingCustomer(ctx context.Context, pool *pgxpool.Pool, hotelID u
 // nextCustomerCode allocates the next CUST-nnnn for a tenant.
 // accounting_customers.code is UNIQUE(hotel_id, code) and NOT NULL, so a code
 // must be generated rather than left blank.
-func nextCustomerCode(ctx context.Context, pool *pgxpool.Pool, hotelID uuid.UUID) (string, error) {
+func nextCustomerCode(ctx context.Context, pool postgres.Querier, hotelID uuid.UUID) (string, error) {
 	var maxNum int
 	err := pool.QueryRow(ctx, `
 		SELECT COALESCE(MAX(NULLIF(regexp_replace(code, '\D', '', 'g'), '')::int), 0)
@@ -159,7 +159,7 @@ func isCreditSettlement(method string) bool {
 //
 // The credit case is why a customer is mandatory for credit sales: an unnamed
 // receivable cannot be collected. Revenue and GST legs are identical either way.
-func postSalesToLedgerFor(ctx context.Context, pool *pgxpool.Pool, hotelID uuid.UUID, method string, subtotal, tax, total float64, reference, description string, customerID uuid.UUID) (uuid.UUID, error) {
+func postSalesToLedgerFor(ctx context.Context, pool postgres.Querier, hotelID uuid.UUID, method string, subtotal, tax, total float64, reference, description string, customerID uuid.UUID) (uuid.UUID, error) {
 	if !isCreditSettlement(method) {
 		return postSalesToLedger(ctx, pool, hotelID, method, subtotal, tax, total, reference, description)
 	}
@@ -205,7 +205,7 @@ func isPaidStatus(s string) bool {
 // alreadyPosted reports whether a journal already exists for this reference.
 // PATCH /pos/orders/:id is a generic column patcher a client may send more than
 // once, so without this guard the same sale would be booked repeatedly.
-func alreadyPosted(ctx context.Context, pool *pgxpool.Pool, hotelID uuid.UUID, reference string) bool {
+func alreadyPosted(ctx context.Context, pool postgres.Querier, hotelID uuid.UUID, reference string) bool {
 	var n int
 	if err := pool.QueryRow(ctx,
 		`SELECT COUNT(*) FROM accounting_journal_entries WHERE hotel_id=$1 AND reference=$2`,
@@ -221,7 +221,7 @@ func alreadyPosted(ctx context.Context, pool *pgxpool.Pool, hotelID uuid.UUID, r
 // row rather than the request, so a patched total cannot mis-state revenue.
 // customerName is the only customer signal the legacy table carries; a phone is
 // not collected there, so a customer is linked only when one already matches.
-func postLegacyPOSOrder(ctx context.Context, pool *pgxpool.Pool, hotelID uuid.UUID, orderNumber, status, paymentMethod, customerName string, subtotal, tax, total float64) {
+func postLegacyPOSOrder(ctx context.Context, pool postgres.Querier, hotelID uuid.UUID, orderNumber, status, paymentMethod, customerName string, subtotal, tax, total float64) {
 	if !isPaidStatus(status) || round2(total) == 0 {
 		return
 	}

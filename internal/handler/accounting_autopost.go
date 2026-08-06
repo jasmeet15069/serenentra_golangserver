@@ -7,7 +7,7 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/hotelharmony/api/internal/repository/postgres"
 )
 
 // Accounting auto-posting — connects operational events (POS sales, etc.) to the
@@ -38,7 +38,7 @@ var standardChart = []defaultAccount{
 
 // ensureChartOfAccounts inserts any missing standard accounts and returns a
 // code -> account_id map for the tenant. Safe to call on every post.
-func ensureChartOfAccounts(ctx context.Context, pool *pgxpool.Pool, hotelID uuid.UUID) (map[string]uuid.UUID, error) {
+func ensureChartOfAccounts(ctx context.Context, pool postgres.Querier, hotelID uuid.UUID) (map[string]uuid.UUID, error) {
 	for _, a := range standardChart {
 		if _, err := pool.Exec(ctx, `
 			INSERT INTO accounting_accounts (id, hotel_id, code, name, type, sub_type, is_active, display_order, created_at, updated_at)
@@ -75,7 +75,7 @@ type journalLine struct {
 // postJournal writes a balanced journal entry + lines for the tenant. Lines whose
 // account code is unknown are skipped; a zero-amount line is skipped. Returns the
 // entry id. The caller is responsible for balance (debits == credits).
-func postJournal(ctx context.Context, pool *pgxpool.Pool, hotelID uuid.UUID, description, reference string, lines []journalLine) (uuid.UUID, error) {
+func postJournal(ctx context.Context, pool postgres.Querier, hotelID uuid.UUID, description, reference string, lines []journalLine) (uuid.UUID, error) {
 	accounts, err := ensureChartOfAccounts(ctx, pool, hotelID)
 	if err != nil {
 		return uuid.Nil, err
@@ -124,7 +124,7 @@ func postJournal(ctx context.Context, pool *pgxpool.Pool, hotelID uuid.UUID, des
 //
 // COGS/Inventory are posted separately (needs item cost — Phase 2). round2 keeps it
 // balanced when subtotal+tax != total (cash rounding): any residual lands on revenue.
-func postSalesToLedger(ctx context.Context, pool *pgxpool.Pool, hotelID uuid.UUID, method string, subtotal, tax, total float64, reference, description string) (uuid.UUID, error) {
+func postSalesToLedger(ctx context.Context, pool postgres.Querier, hotelID uuid.UUID, method string, subtotal, tax, total float64, reference, description string) (uuid.UUID, error) {
 	cash := "1010" // bank for card/upi/other
 	if method == "cash" {
 		cash = "1000"
@@ -152,7 +152,7 @@ func cashAccount(method string) string {
 // quantity * menu_items.cost_price over every non-void KOT item. Free-text items
 // (no menu_item_id) and items with an unset cost contribute 0. Returns 0 on any
 // error so a missing cost table never blocks a sale.
-func sessionCOGS(ctx context.Context, pool *pgxpool.Pool, sessionID uuid.UUID) float64 {
+func sessionCOGS(ctx context.Context, pool postgres.Querier, sessionID uuid.UUID) float64 {
 	var cogs float64
 	_ = pool.QueryRow(ctx, `
 		SELECT COALESCE(SUM(ki.quantity * COALESCE(mi.cost_price, 0)), 0)
@@ -166,7 +166,7 @@ func sessionCOGS(ctx context.Context, pool *pgxpool.Pool, sessionID uuid.UUID) f
 // postCOGS records the cost side of a sale: Dr Cost of Goods Sold, Cr Inventory.
 // This is the D365 "inventory reduced" leg — it hits P&L (COGS) and lowers the
 // Inventory asset. Skipped automatically when cogs is 0 (no cost data yet).
-func postCOGS(ctx context.Context, pool *pgxpool.Pool, hotelID uuid.UUID, cogs float64, reference, description string) (uuid.UUID, error) {
+func postCOGS(ctx context.Context, pool postgres.Querier, hotelID uuid.UUID, cogs float64, reference, description string) (uuid.UUID, error) {
 	if round2(cogs) == 0 {
 		return uuid.Nil, nil
 	}
@@ -178,7 +178,7 @@ func postCOGS(ctx context.Context, pool *pgxpool.Pool, hotelID uuid.UUID, cogs f
 
 // postRoomRevenue books a cash/card settlement against room/folio charges:
 // Dr Cash/Bank total, Cr Sales Revenue (net), Cr GST Payable (tax).
-func postRoomRevenue(ctx context.Context, pool *pgxpool.Pool, hotelID uuid.UUID, method string, tax, total float64, reference, description string) (uuid.UUID, error) {
+func postRoomRevenue(ctx context.Context, pool postgres.Querier, hotelID uuid.UUID, method string, tax, total float64, reference, description string) (uuid.UUID, error) {
 	return postJournal(ctx, pool, hotelID, description, reference, []journalLine{
 		{accountCode: cashAccount(method), debit: round2(total), memo: "Folio settlement (" + method + ")"},
 		{accountCode: "4000", credit: round2(total - tax), memo: "Room revenue"},
@@ -188,7 +188,7 @@ func postRoomRevenue(ctx context.Context, pool *pgxpool.Pool, hotelID uuid.UUID,
 
 // postARInvoice books a posted sales invoice on accrual terms:
 // Dr Accounts Receivable total, Cr Sales Revenue (net), Cr GST Payable (tax).
-func postARInvoice(ctx context.Context, pool *pgxpool.Pool, hotelID uuid.UUID, tax, total float64, reference, description string) (uuid.UUID, error) {
+func postARInvoice(ctx context.Context, pool postgres.Querier, hotelID uuid.UUID, tax, total float64, reference, description string) (uuid.UUID, error) {
 	return postJournal(ctx, pool, hotelID, description, reference, []journalLine{
 		{accountCode: "1200", debit: round2(total), memo: "Invoice receivable"},
 		{accountCode: "4000", credit: round2(total - tax), memo: "Sales revenue"},
@@ -198,7 +198,7 @@ func postARInvoice(ctx context.Context, pool *pgxpool.Pool, hotelID uuid.UUID, t
 
 // postCreditNoteReversal reverses revenue on a posted customer credit note:
 // Dr Sales Revenue (net) + Dr GST Payable (tax), Cr Accounts Receivable total.
-func postCreditNoteReversal(ctx context.Context, pool *pgxpool.Pool, hotelID uuid.UUID, tax, total float64, reference, description string) (uuid.UUID, error) {
+func postCreditNoteReversal(ctx context.Context, pool postgres.Querier, hotelID uuid.UUID, tax, total float64, reference, description string) (uuid.UUID, error) {
 	return postJournal(ctx, pool, hotelID, description, reference, []journalLine{
 		{accountCode: "4000", debit: round2(total - tax), memo: "Revenue reversed"},
 		{accountCode: "2100", debit: round2(tax), memo: "GST reversed"},
@@ -208,7 +208,7 @@ func postCreditNoteReversal(ctx context.Context, pool *pgxpool.Pool, hotelID uui
 
 // postGoodsReceipt books inventory received against a supplier (D365 GRN post):
 // Dr Inventory, Cr Accounts Payable. amount is the accepted-goods value.
-func postGoodsReceipt(ctx context.Context, pool *pgxpool.Pool, hotelID uuid.UUID, amount float64, reference, description string) (uuid.UUID, error) {
+func postGoodsReceipt(ctx context.Context, pool postgres.Querier, hotelID uuid.UUID, amount float64, reference, description string) (uuid.UUID, error) {
 	return postJournal(ctx, pool, hotelID, description, reference, []journalLine{
 		{accountCode: "1400", debit: round2(amount), memo: "Goods received"},
 		{accountCode: "2000", credit: round2(amount), memo: "Payable to vendor"},
@@ -222,7 +222,7 @@ func postGoodsReceipt(ctx context.Context, pool *pgxpool.Pool, hotelID uuid.UUID
 // and the net GL effect is zero. Reverses all legs at once (e.g. both the revenue
 // and the COGS entry of a POS bill). Returns the new entry id, or Nil if nothing
 // carried that reference.
-func reverseJournalsByReference(ctx context.Context, pool *pgxpool.Pool, hotelID uuid.UUID, reference, description string) (uuid.UUID, error) {
+func reverseJournalsByReference(ctx context.Context, pool postgres.Querier, hotelID uuid.UUID, reference, description string) (uuid.UUID, error) {
 	rows, err := pool.Query(ctx, `
 		SELECT jl.account_id, jl.debit, jl.credit
 		FROM accounting_journal_lines jl
@@ -267,7 +267,7 @@ func reverseJournalsByReference(ctx context.Context, pool *pgxpool.Pool, hotelID
 
 // postAPSettlement books paying a supplier: Dr Accounts Payable, Cr Cash/Bank.
 // Clears the payable that a goods receipt (or vendor invoice) created.
-func postAPSettlement(ctx context.Context, pool *pgxpool.Pool, hotelID uuid.UUID, method string, amount float64, reference, description string) (uuid.UUID, error) {
+func postAPSettlement(ctx context.Context, pool postgres.Querier, hotelID uuid.UUID, method string, amount float64, reference, description string) (uuid.UUID, error) {
 	return postJournal(ctx, pool, hotelID, description, reference, []journalLine{
 		{accountCode: "2000", debit: round2(amount), memo: "Payable settled"},
 		{accountCode: cashAccount(method), credit: round2(amount), memo: "Vendor payment (" + method + ")"},
@@ -276,7 +276,7 @@ func postAPSettlement(ctx context.Context, pool *pgxpool.Pool, hotelID uuid.UUID
 
 // postVendorDebitNote books a purchase return / vendor debit note:
 // Dr Accounts Payable total, Cr Inventory total (goods returned reduce what we owe).
-func postVendorDebitNote(ctx context.Context, pool *pgxpool.Pool, hotelID uuid.UUID, total float64, reference, description string) (uuid.UUID, error) {
+func postVendorDebitNote(ctx context.Context, pool postgres.Querier, hotelID uuid.UUID, total float64, reference, description string) (uuid.UUID, error) {
 	return postJournal(ctx, pool, hotelID, description, reference, []journalLine{
 		{accountCode: "2000", debit: round2(total), memo: "Payable reduced"},
 		{accountCode: "1400", credit: round2(total), memo: "Goods returned"},
@@ -320,7 +320,7 @@ func voucherTypeFor(reference string) string {
 // Allocation is a single atomic UPSERT against a counter row. MAX(voucher_no)+1
 // would let two concurrent tills read the same maximum and be handed the same
 // number, which a unique index would then reject - losing one of the sales.
-func nextVoucherNo(ctx context.Context, pool *pgxpool.Pool, hotelID uuid.UUID, vType string) (string, error) {
+func nextVoucherNo(ctx context.Context, pool postgres.Querier, hotelID uuid.UUID, vType string) (string, error) {
 	var n int64
 	err := pool.QueryRow(ctx, `
 		INSERT INTO accounting_voucher_counters (hotel_id, voucher_type, next_no)

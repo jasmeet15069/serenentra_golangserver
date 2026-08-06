@@ -59,15 +59,23 @@ func (h *BookingHandler) CheckAvailability(c *fiber.Ctx) error {
 		return response.Error(c, fiber.StatusBadRequest, "check_in and check_out are required")
 	}
 
+	// Counted against guest_stays, which is where reservations actually live.
+	// Reading bookings meant a fully booked hotel reported every room free.
+	//
+	// The sellable denominator excludes only maintenance rooms: a room that is
+	// occupied or being cleaned today is still sellable for a future date, and
+	// the per-day occupancy below is what removes it on the days it is taken.
 	rows, err := tenantPool(c, h.pool).Query(c.Context(), `
 		SELECT d.date::text,
-		       (SELECT COUNT(*) FROM rooms r WHERE r.hotel_id = $1 AND r.status = 'available')
-		       - COALESCE(COUNT(b.id) FILTER (WHERE b.status IN ('confirmed','checked_in')), 0) AS available,
+		       (SELECT COUNT(*) FROM rooms r
+		         WHERE r.hotel_id = $1 AND r.status <> 'maintenance')
+		       - COUNT(gs.id) AS available,
 		       (SELECT COUNT(*) FROM rooms r WHERE r.hotel_id = $1) AS total
 		FROM generate_series($2::date, $3::date - 1, '1 day') d(date)
-		LEFT JOIN bookings b ON b.hotel_id = $1
-			AND d.date BETWEEN b.check_in AND b.check_out - 1
-			AND b.status IN ('confirmed', 'checked_in')
+		LEFT JOIN guest_stays gs ON gs.hotel_id = $1
+			AND gs.status <> 'cancelled'
+			AND d.date >= gs.check_in_date::date
+			AND d.date <  gs.check_out_date::date
 		GROUP BY d.date
 		ORDER BY d.date`,
 		tenantHotelID(c), checkIn, checkOut,
@@ -115,21 +123,35 @@ func (h *BookingHandler) SearchRooms(c *fiber.Ctx) error {
 		return response.Error(c, fiber.StatusBadRequest, "check_in and check_out are required")
 	}
 
-	q := `SELECT r.id, r.room_number, r.room_type, r.floor, r.max_guests, r.base_rate
+	// Columns are capacity and price_per_night. This query asked for max_guests
+	// and base_rate, which exist in no migration and in no CREATE TABLE, so the
+	// endpoint answered 42703 undefined_column on every call it ever received.
+	// The JSON field names are left alone so the response contract is unchanged.
+	//
+	// Availability is also read from guest_stays, not bookings. The front desk
+	// writes guest_stays and nothing writes bookings, so excluding on bookings
+	// meant the booking engine offered rooms that were already sold.
+	//
+	// Room status is checked as "not maintenance" rather than "is available",
+	// matching ListRoomsAvailableBetween: status describes the room right now
+	// and says nothing about the requested dates, so filtering on 'available'
+	// hides every room of a full hotel even for dates months away.
+	q := `SELECT r.id, r.room_number, r.room_type, r.floor, r.capacity, r.price_per_night
 	      FROM rooms r
 	      WHERE r.hotel_id = $1
-	        AND r.status = 'available'
-	        AND r.id NOT IN (
-	            SELECT b.room_id FROM bookings b
-	            WHERE b.hotel_id = $1
-	              AND b.status IN ('confirmed', 'checked_in')
-	              AND b.check_in < $3 AND b.check_out > $2
+	        AND r.status <> 'maintenance'
+	        AND NOT EXISTS (
+	            SELECT 1 FROM guest_stays gs
+	            WHERE gs.hotel_id = r.hotel_id
+	              AND gs.room_id = r.id
+	              AND gs.status <> 'cancelled'
+	              AND gs.check_in_date < $3 AND gs.check_out_date > $2
 	        )`
 	args := []interface{}{tenantHotelID(c), req.CheckIn, req.CheckOut}
 	argIdx := 4
 
 	if req.Guests > 0 {
-		q += " AND r.max_guests >= $" + fmt.Sprintf("%d", argIdx)
+		q += " AND r.capacity >= $" + fmt.Sprintf("%d", argIdx)
 		args = append(args, req.Guests)
 		argIdx++
 	}
@@ -322,71 +344,25 @@ func (h *BookingHandler) ValidatePromo(c *fiber.Ctx) error {
 		return response.Error(c, fiber.StatusBadRequest, "code is required")
 	}
 
-	var promoID uuid.UUID
-	var name, discountType string
-	var discountValue float64
-	var usageLimit, usedCount int
-	var validFrom, validTo time.Time
-	var active bool
-
-	err := tenantPool(c, h.pool).QueryRow(c.Context(), `
-		SELECT id, name, discount_type, discount_value,
-		       usage_limit, used_count, valid_from, valid_to, active
-		FROM promotions
-		WHERE hotel_id = $1 AND code = $2`,
-		tenantHotelID(c), req.Code,
-	).Scan(&promoID, &name, &discountType, &discountValue,
-		&usageLimit, &usedCount, &validFrom, &validTo, &active)
+	// Delegated to the shared resolver so this endpoint and the reservation form
+	// cannot diverge on what a code is worth. It additionally enforces
+	// min_nights, min_amount and max_discount, which are columns promotions has
+	// always had and nothing previously checked.
+	//
+	// Nights are unknown here — this endpoint is given only a total — so -1
+	// skips the minimum-stay rule, which this endpoint has never enforced.
+	res, err := resolvePromo(c.Context(), tenantPool(c, h.pool), tenantHotelID(c), req.Code, req.Total, -1)
 	if err != nil {
-		return response.OK(c, validatePromoResponse{
-			Valid:   false,
-			Code:    req.Code,
-			Message: "promo code not found",
-		})
-	}
-
-	if !active {
-		return response.OK(c, validatePromoResponse{
-			Valid:   false,
-			Code:    req.Code,
-			Message: "promo code is inactive",
-		})
-	}
-
-	now := time.Now().UTC()
-	if now.Before(validFrom) || now.After(validTo) {
-		return response.OK(c, validatePromoResponse{
-			Valid:   false,
-			Code:    req.Code,
-			Message: "promo code is expired or not yet valid",
-		})
-	}
-
-	if usageLimit > 0 && usedCount >= usageLimit {
-		return response.OK(c, validatePromoResponse{
-			Valid:   false,
-			Code:    req.Code,
-			Message: "promo code usage limit reached",
-		})
-	}
-
-	var discount float64
-	if discountType == "percentage" {
-		discount = req.Total * discountValue / 100
-	} else {
-		discount = discountValue
-	}
-	if discount > req.Total {
-		discount = req.Total
+		return response.Error(c, fiber.StatusInternalServerError, "failed to validate promo code")
 	}
 
 	return response.OK(c, validatePromoResponse{
-		Valid:      true,
-		Code:       req.Code,
-		Name:       name,
-		Discount:   discount,
-		Discounted: req.Total - discount,
-		Message:    "promo code applied successfully",
+		Valid:      res.Valid,
+		Code:       res.Code,
+		Name:       res.Name,
+		Discount:   res.Discount,
+		Discounted: round2(req.Total - res.Discount),
+		Message:    res.Message,
 	})
 }
 

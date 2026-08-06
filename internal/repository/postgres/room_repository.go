@@ -32,9 +32,14 @@ type RoomRepository interface {
 	ListStays(ctx context.Context, hotelID uuid.UUID, filters map[string]interface{}) ([]domain.GuestStay, error)
 	RoomHasActiveStay(ctx context.Context, hotelID, roomID uuid.UUID) (bool, error)
 	EnsureGuest(ctx context.Context, hotelID uuid.UUID, name, email, phone string) (uuid.UUID, error)
+	SetGuestIdentity(ctx context.Context, hotelID, guestID uuid.UUID, idType, idNumber string) error
 	EnsureFolioForBooking(ctx context.Context, hotelID, bookingID, guestID uuid.UUID, currency string) (uuid.UUID, error)
 	UpdateStay(ctx context.Context, hotelID, id uuid.UUID, fields map[string]interface{}) error
 	DeleteStay(ctx context.Context, hotelID, id uuid.UUID) error
+	SoftCancelStay(ctx context.Context, hotelID, id uuid.UUID, reason string, fee float64, by *uuid.UUID) error
+	RoomIsFree(ctx context.Context, hotelID, roomID uuid.UUID, checkIn, checkOut time.Time, excludeStayID uuid.UUID) (bool, error)
+	HotelName(ctx context.Context, hotelID uuid.UUID) (string, error)
+	HotelGSTRate(ctx context.Context, hotelID uuid.UUID) (float64, error)
 
 	SmartCheckinLookup(ctx context.Context, hotelID uuid.UUID, guestName, phone string) (*domain.GuestStay, error)
 }
@@ -45,6 +50,36 @@ type roomRepository struct {
 
 func NewRoomRepository(db *DB) RoomRepository {
 	return &roomRepository{db: db}
+}
+
+// stayColumns is the single definition of which guest_stays columns are read
+// and in what order. Every stay query selects it and every scan helper reads it
+// in the same order, so adding a column is one edit instead of six that have to
+// agree — and a mismatch between them is what makes pgx fail an entire scan.
+//
+// Qualified with gs. because all the read queries join rooms.
+const stayColumns = `gs.id, gs.hotel_id, gs.guest_id, gs.room_id, gs.guest_name, gs.guest_email, gs.guest_phone,
+	gs.check_in_date, gs.check_out_date, gs.actual_check_in, gs.actual_check_out,
+	gs.total_amount, gs.notes, gs.source, gs.created_by, gs.created_at, gs.updated_at,
+	gs.status, gs.confirmation_no, gs.cancelled_at, gs.cancellation_reason, gs.cancellation_fee,
+	gs.adults, gs.children, gs.approach_type, gs.discount_amount, gs.tax_amount, gs.promo_code`
+
+// stayColumnsBare is the same list without the table alias, for INSERT ... RETURNING.
+const stayColumnsBare = `id, hotel_id, guest_id, room_id, guest_name, guest_email, guest_phone,
+	check_in_date, check_out_date, actual_check_in, actual_check_out,
+	total_amount, notes, source, created_by, created_at, updated_at,
+	status, confirmation_no, cancelled_at, cancellation_reason, cancellation_fee,
+	adults, children, approach_type, discount_amount, tax_amount, promo_code`
+
+// stayScanTargets returns the scan destinations for stayColumns, in order.
+func stayScanTargets(s *domain.GuestStay) []any {
+	return []any{
+		&s.ID, &s.HotelID, &s.GuestID, &s.RoomID, &s.GuestName, &s.GuestEmail, &s.GuestPhone,
+		&s.CheckInDate, &s.CheckOutDate, &s.ActualCheckIn, &s.ActualCheckOut,
+		&s.TotalAmount, &s.Notes, &s.Source, &s.CreatedBy, &s.CreatedAt, &s.UpdatedAt,
+		&s.Status, &s.ConfirmationNo, &s.CancelledAt, &s.CancellationReason, &s.CancellationFee,
+		&s.Adults, &s.Children, &s.ApproachType, &s.DiscountAmount, &s.TaxAmount, &s.PromoCode,
+	}
 }
 
 // Rooms
@@ -238,32 +273,46 @@ func (r *roomRepository) UpdateRoomStatus(ctx context.Context, hotelID, id uuid.
 // Guest Stays
 
 func (r *roomRepository) CreateStay(ctx context.Context, hotelID uuid.UUID, s *domain.GuestStay) (*domain.GuestStay, error) {
-	const q = `
+	q := `
 		INSERT INTO guest_stays (
 			id, hotel_id, guest_id, room_id, guest_name, guest_email, guest_phone,
 			check_in_date, check_out_date, actual_check_in, actual_check_out,
-			total_amount, notes, source, created_by, created_at, updated_at
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$16)
-		RETURNING id, hotel_id, guest_id, room_id, guest_name, guest_email, guest_phone,
-		          check_in_date, check_out_date, actual_check_in, actual_check_out,
-		          total_amount, notes, source, created_by, created_at, updated_at`
+			total_amount, notes, source, created_by, created_at, updated_at,
+			status, confirmation_no, adults, children, approach_type,
+			discount_amount, tax_amount, promo_code
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$16,
+		          $17,$18,$19,$20,$21,$22,$23,$24)
+		RETURNING ` + stayColumnsBare
 	s.ID = uuid.New()
 	s.HotelID = hotelID
 	now := time.Now().UTC()
+
+	// Defaults for a caller that did not set the newer fields, so an older code
+	// path constructing a GuestStay by hand cannot write a zero occupancy or an
+	// empty status that the CHECK constraints would reject.
+	if s.Status == "" {
+		s.Status = domain.ReservationConfirmed
+	}
+	if s.Adults <= 0 {
+		s.Adults = 1
+	}
+	if s.ApproachType == "" {
+		s.ApproachType = "manual"
+	}
+
 	row := poolFromContext(ctx, r.db.Pool).QueryRow(ctx, q,
 		s.ID, s.HotelID, s.GuestID, s.RoomID, s.GuestName, s.GuestEmail, s.GuestPhone,
 		s.CheckInDate, s.CheckOutDate, s.ActualCheckIn, s.ActualCheckOut,
 		s.TotalAmount, s.Notes, s.Source, s.CreatedBy, now,
+		s.Status, s.ConfirmationNo, s.Adults, s.Children, s.ApproachType,
+		s.DiscountAmount, s.TaxAmount, s.PromoCode,
 	)
 	return scanSingleStay(row)
 }
 
 func (r *roomRepository) FindStayByID(ctx context.Context, hotelID, id uuid.UUID) (*domain.GuestStay, error) {
 	const q = `
-		SELECT gs.id, gs.hotel_id, gs.guest_id, gs.room_id, gs.guest_name, gs.guest_email, gs.guest_phone,
-		       gs.check_in_date, gs.check_out_date, gs.actual_check_in, gs.actual_check_out,
-		       gs.total_amount, gs.notes, gs.source, gs.created_by, gs.created_at, gs.updated_at,
-		       r.room_number, r.room_type
+		SELECT ` + stayColumns + `, r.room_number, r.room_type
 		FROM guest_stays gs
 		LEFT JOIN rooms r ON r.id = gs.room_id
 		WHERE gs.hotel_id = $1 AND gs.id = $2`
@@ -274,10 +323,7 @@ func (r *roomRepository) FindStayByID(ctx context.Context, hotelID, id uuid.UUID
 func (r *roomRepository) ListStays(ctx context.Context, hotelID uuid.UUID, filters map[string]interface{}) ([]domain.GuestStay, error) {
 	// Build query dynamically based on filters; only safe column names are allowed.
 	allowedCols := map[string]bool{"guest_id": true, "room_id": true, "status": true}
-	q := `SELECT gs.id, gs.hotel_id, gs.guest_id, gs.room_id, gs.guest_name, gs.guest_email, gs.guest_phone,
-		         gs.check_in_date, gs.check_out_date, gs.actual_check_in, gs.actual_check_out,
-		         gs.total_amount, gs.notes, gs.source, gs.created_by, gs.created_at, gs.updated_at,
-		         r.room_number, r.room_type
+	q := `SELECT ` + stayColumns + `, r.room_number, r.room_type
 		  FROM guest_stays gs LEFT JOIN rooms r ON r.id = gs.room_id
 		  WHERE gs.hotel_id = $1`
 	args := []interface{}{hotelID}
@@ -303,12 +349,7 @@ func (r *roomRepository) ListStays(ctx context.Context, hotelID uuid.UUID, filte
 	for rows.Next() {
 		var s domain.GuestStay
 		var roomNumber, roomType *string
-		if err := rows.Scan(
-			&s.ID, &s.HotelID, &s.GuestID, &s.RoomID, &s.GuestName, &s.GuestEmail, &s.GuestPhone,
-			&s.CheckInDate, &s.CheckOutDate, &s.ActualCheckIn, &s.ActualCheckOut,
-			&s.TotalAmount, &s.Notes, &s.Source, &s.CreatedBy, &s.CreatedAt, &s.UpdatedAt,
-			&roomNumber, &roomType,
-		); err != nil {
+		if err := rows.Scan(append(stayScanTargets(&s), &roomNumber, &roomType)...); err != nil {
 			return nil, err
 		}
 		if roomNumber != nil {
@@ -423,6 +464,26 @@ func (r *roomRepository) EnsureGuest(ctx context.Context, hotelID uuid.UUID, nam
 	return id, nil
 }
 
+// SetGuestIdentity records the ID proof captured at the desk.
+//
+// guests.id_type and id_number have existed since the first migration and
+// nothing has ever written them, so no guest in the system carries the identity
+// document the front desk is required to record.
+//
+// Only fills a blank: an ID already on file is not overwritten by a later
+// booking where the clerk typed less, and a blank submission never erases one.
+func (r *roomRepository) SetGuestIdentity(ctx context.Context, hotelID, guestID uuid.UUID, idType, idNumber string) error {
+	const q = `
+		UPDATE guests
+		   SET id_type   = COALESCE(NULLIF(id_type,''),   NULLIF($3,'')),
+		       id_number = COALESCE(NULLIF(id_number,''), NULLIF($4,'')),
+		       updated_at = now()
+		 WHERE hotel_id = $1 AND id = $2`
+	_, err := poolFromContext(ctx, r.db.Pool).Exec(ctx, q,
+		hotelID, guestID, strings.TrimSpace(idType), strings.TrimSpace(idNumber))
+	return err
+}
+
 // EnsureFolioForBooking opens the guest's folio for a booking, or returns the
 // existing one. Idempotent, so a repeated check-in cannot open a second folio
 // and split one stay's charges across two bills.
@@ -479,15 +540,105 @@ func (r *roomRepository) DeleteStay(ctx context.Context, hotelID, id uuid.UUID) 
 	return err
 }
 
+// SoftCancelStay marks a reservation cancelled instead of deleting the row.
+//
+// Cancelling used to DELETE, which destroyed the only record that the booking
+// had ever existed: no reason, no fee, no audit trail, and no way to tell a
+// cancellation from a no-show or from a booking that was never taken.
+// Cancelled-revenue reporting was impossible and the deletion was
+// unrecoverable.
+//
+// Refuses to cancel a stay that is already cancelled, so a repeated request
+// cannot overwrite the original reason and timestamp with a later one.
+func (r *roomRepository) SoftCancelStay(ctx context.Context, hotelID, id uuid.UUID, reason string, fee float64, by *uuid.UUID) error {
+	const q = `
+		UPDATE guest_stays
+		   SET status = 'cancelled',
+		       cancelled_at = now(),
+		       cancellation_reason = NULLIF($3, ''),
+		       cancellation_fee = $4,
+		       cancelled_by = $5,
+		       updated_at = now()
+		 WHERE hotel_id = $1 AND id = $2 AND status <> 'cancelled'`
+	tag, err := poolFromContext(ctx, r.db.Pool).Exec(ctx, q, hotelID, id, reason, fee, by)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// RoomIsFree reports whether a room has no other stay overlapping
+// [checkIn, checkOut). excludeStayID lets an edit ignore the stay being edited,
+// which would otherwise always collide with itself.
+//
+// Comparisons are strict and cancelled stays are ignored, matching
+// ListRoomsAvailableBetween and the guest_stays_no_overlap constraint, so all
+// three agree on what "free" means.
+func (r *roomRepository) RoomIsFree(ctx context.Context, hotelID, roomID uuid.UUID, checkIn, checkOut time.Time, excludeStayID uuid.UUID) (bool, error) {
+	const q = `
+		SELECT NOT EXISTS (
+			SELECT 1 FROM guest_stays
+			WHERE hotel_id = $1
+			  AND room_id = $2
+			  AND status <> 'cancelled'
+			  AND id <> $3
+			  AND check_in_date < $5
+			  AND check_out_date > $4
+		)`
+	var free bool
+	err := poolFromContext(ctx, r.db.Pool).QueryRow(ctx, q, hotelID, roomID, excludeStayID, checkIn, checkOut).Scan(&free)
+	return free, err
+}
+
+// HotelGSTRate returns the tenant's configured GST percentage.
+//
+// This is the authoritative rate — the same column the tax-invoice fields use.
+// The booking wizard previously hardcoded 18% on the client, displayed a total
+// including it, and then sent nothing, so the figure the guest agreed to and
+// the figure stored on the reservation disagreed by that 18% on every booking.
+//
+// A tenant that has not configured a rate has 0, which is the column default
+// and means "quote no tax" rather than "guess".
+func (r *roomRepository) HotelGSTRate(ctx context.Context, hotelID uuid.UUID) (float64, error) {
+	var rate float64
+	err := poolFromContext(ctx, r.db.Pool).
+		QueryRow(ctx, `SELECT COALESCE(gst_rate, 0) FROM hotels WHERE id = $1`, hotelID).Scan(&rate)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, ErrNotFound
+		}
+		return 0, err
+	}
+	return rate, nil
+}
+
+// HotelName returns the tenant's own name, for guest-facing messages.
+//
+// Check-in and check-out notifications hardcoded "Grand Hotel Mumbai", so every
+// tenant's guests were told the name of a different hotel.
+func (r *roomRepository) HotelName(ctx context.Context, hotelID uuid.UUID) (string, error) {
+	var name string
+	err := poolFromContext(ctx, r.db.Pool).
+		QueryRow(ctx, `SELECT name FROM hotels WHERE id = $1`, hotelID).Scan(&name)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", ErrNotFound
+		}
+		return "", err
+	}
+	return name, nil
+}
+
 func (r *roomRepository) SmartCheckinLookup(ctx context.Context, hotelID uuid.UUID, guestName, phone string) (*domain.GuestStay, error) {
 	const q = `
-		SELECT gs.id, gs.hotel_id, gs.guest_id, gs.room_id, gs.guest_name, gs.guest_email, gs.guest_phone,
-		       gs.check_in_date, gs.check_out_date, gs.actual_check_in, gs.actual_check_out,
-		       gs.total_amount, gs.notes, gs.source, gs.created_by, gs.created_at, gs.updated_at,
-		       r.room_number, r.room_type
+		SELECT ` + stayColumns + `, r.room_number, r.room_type
 		FROM guest_stays gs
 		LEFT JOIN rooms r ON r.id = gs.room_id
 		WHERE gs.hotel_id = $1 AND (gs.guest_name ILIKE $2 OR gs.guest_phone ILIKE $3)
+		  AND gs.status <> 'cancelled'
 		ORDER BY gs.check_in_date DESC
 		LIMIT 1`
 	row := poolFromContext(ctx, r.db.Pool).QueryRow(ctx, q, hotelID, "%"+guestName+"%", "%"+phone+"%")
@@ -517,11 +668,7 @@ func scanRooms(rows pgx.Rows) ([]domain.Room, error) {
 
 func scanSingleStay(row pgx.Row) (*domain.GuestStay, error) {
 	s := &domain.GuestStay{}
-	err := row.Scan(
-		&s.ID, &s.HotelID, &s.GuestID, &s.RoomID, &s.GuestName, &s.GuestEmail, &s.GuestPhone,
-		&s.CheckInDate, &s.CheckOutDate, &s.ActualCheckIn, &s.ActualCheckOut,
-		&s.TotalAmount, &s.Notes, &s.Source, &s.CreatedBy, &s.CreatedAt, &s.UpdatedAt,
-	)
+	err := row.Scan(stayScanTargets(s)...)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrNotFound
@@ -534,12 +681,7 @@ func scanSingleStay(row pgx.Row) (*domain.GuestStay, error) {
 func scanEnrichedStay(row pgx.Row) (*domain.GuestStay, error) {
 	s := &domain.GuestStay{}
 	var roomNumber, roomType *string
-	err := row.Scan(
-		&s.ID, &s.HotelID, &s.GuestID, &s.RoomID, &s.GuestName, &s.GuestEmail, &s.GuestPhone,
-		&s.CheckInDate, &s.CheckOutDate, &s.ActualCheckIn, &s.ActualCheckOut,
-		&s.TotalAmount, &s.Notes, &s.Source, &s.CreatedBy, &s.CreatedAt, &s.UpdatedAt,
-		&roomNumber, &roomType,
-	)
+	err := row.Scan(append(stayScanTargets(s), &roomNumber, &roomType)...)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrNotFound

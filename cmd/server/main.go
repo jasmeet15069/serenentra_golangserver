@@ -115,7 +115,7 @@ func main() {
 
 	v := validator.New()
 	userHandler := handler.NewUserHandler(userRepo, authSvc, v, cfg.Auth.AccessTokenSecret)
-	reservationHandler := handler.NewReservationHandler(roomRepo, cfg, emailSvc, smsSvc)
+	reservationHandler := handler.NewReservationHandler(roomRepo, db, cfg, emailSvc, smsSvc)
 	handler.Register(app, handler.Handlers{
 		Health:         handler.NewHealthHandler(db, c),
 		Auth:           handler.NewAuthHandler(authSvc, v, db.Pool, c, cfg.Provisioning.TenantBaseDomain),

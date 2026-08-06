@@ -6,10 +6,12 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
@@ -22,20 +24,64 @@ type DB struct {
 	logger *zap.Logger
 }
 
-// poolFromContext returns the tenant-scoped pool the request middleware stashed
-// under "tenant_pool" (Fiber Locals -> fasthttp user value, readable here via
-// ctx.Value because handlers pass the *fasthttp.RequestCtx), falling back to the
-// repository's own (shared) pool. This makes the shared-pool repositories operate
-// on a dedicated tenant's OWN database when one exists — matching the compat/bulk
-// paths. Without it, repo reads/writes always hit the shared DB, so a dedicated
-// tenant's rooms/reservations created via bulk/compat were invisible to /api/rooms
-// and reservation lookups failed. Non-request contexts (background jobs) carry no
-// such value and correctly fall back to the shared pool.
-func poolFromContext(ctx context.Context, fallback *pgxpool.Pool) *pgxpool.Pool {
+// Querier is the subset of pgx both *pgxpool.Pool and pgx.Tx implement. Every
+// repository method executes through it rather than against a pool directly,
+// which is what lets an existing method run inside a caller's transaction
+// without any change to its SQL: WithTenantTx puts a pgx.Tx in the context and
+// poolFromContext hands it back in place of the pool.
+type Querier interface {
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+}
+
+// txContextKey marks a transaction stashed in the context by WithTenantTx.
+// A distinct unexported type, so it cannot collide with the string keys Fiber
+// uses for Locals.
+type txContextKey struct{}
+
+// poolFromContext returns the executor a repository should use, in precedence
+// order:
+//
+//  1. a transaction opened by WithTenantTx, so calls made inside it enlist
+//     rather than committing independently on a separate connection;
+//  2. the tenant-scoped pool the request middleware stashed under "tenant_pool"
+//     (Fiber Locals -> fasthttp user value, readable here via ctx.Value because
+//     handlers pass the *fasthttp.RequestCtx);
+//  3. the repository's own (shared) pool.
+//
+// Step 2 makes the shared-pool repositories operate on a dedicated tenant's OWN
+// database when one exists — matching the compat/bulk paths. Without it, repo
+// reads/writes always hit the shared DB, so a dedicated tenant's
+// rooms/reservations created via bulk/compat were invisible to /api/rooms and
+// reservation lookups failed. Non-request contexts (background jobs) carry
+// neither value and correctly fall back to the shared pool.
+func poolFromContext(ctx context.Context, fallback *pgxpool.Pool) Querier {
+	if tx, ok := ctx.Value(txContextKey{}).(pgx.Tx); ok && tx != nil {
+		return tx
+	}
 	if p, ok := ctx.Value("tenant_pool").(*pgxpool.Pool); ok && p != nil {
 		return p
 	}
 	return fallback
+}
+
+// PoolForContext exposes the tenant-resolution rule above to callers outside
+// this package (handlers that hold a raw pool), without exposing the
+// transaction: a handler that wants one should use WithTenantTx.
+func PoolForContext(ctx context.Context, fallback *pgxpool.Pool) *pgxpool.Pool {
+	if p, ok := ctx.Value("tenant_pool").(*pgxpool.Pool); ok && p != nil {
+		return p
+	}
+	return fallback
+}
+
+// Querier returns the executor for ctx — the caller's transaction when
+// WithTenantTx opened one, otherwise the tenant pool. Handlers use this to run
+// helper functions (accounting postings, promo redemption) inside the same
+// transaction as the repository calls around them.
+func (d *DB) Querier(ctx context.Context) Querier {
+	return poolFromContext(ctx, d.Pool)
 }
 
 // New opens and validates a pgxpool connection.
@@ -109,8 +155,14 @@ func (d *DB) Close() {
 
 // WithTx runs fn inside a database transaction, rolling back on any error
 // and committing on success. Nested calls are not supported.
+//
+// The transaction is opened on the pool the context resolves to, not
+// unconditionally on the shared pool. For a tenant with a dedicated database
+// those are different pools, and beginning on the shared one would commit the
+// transaction's writes to the wrong database while the rest of the request read
+// and wrote the tenant's own.
 func (d *DB) WithTx(ctx context.Context, fn func(pgx.Tx) error) error {
-	tx, err := d.Pool.BeginTx(ctx, pgx.TxOptions{
+	tx, err := PoolForContext(ctx, d.Pool).BeginTx(ctx, pgx.TxOptions{
 		IsoLevel:   pgx.ReadCommitted,
 		AccessMode: pgx.ReadWrite,
 	})
@@ -127,6 +179,52 @@ func (d *DB) WithTx(ctx context.Context, fn func(pgx.Tx) error) error {
 
 	if err := fn(tx); err != nil {
 		if rbErr := tx.Rollback(ctx); rbErr != nil {
+			d.logger.Error("postgres: rollback failed", zap.Error(rbErr))
+		}
+		return err
+	}
+
+	return tx.Commit(ctx)
+}
+
+// WithTenantTx runs fn inside a transaction on the context's tenant pool,
+// handing fn a context that carries the transaction. Any repository method
+// called with that context executes inside the transaction instead of on its
+// own connection, so a multi-step write either lands whole or not at all
+// without duplicating a single line of the SQL those methods already hold.
+//
+// This is what makes reservation creation atomic: the guest record, the stay,
+// the folio, the payment and the ledger posting are one unit, where previously
+// each was a separate statement whose error the caller discarded.
+//
+// Nested calls are not supported — fn is already inside a transaction, so
+// calling WithTenantTx again with the derived context would open a second,
+// independent one on another connection and quietly defeat the atomicity. The
+// guard below returns an error rather than allowing that.
+func (d *DB) WithTenantTx(ctx context.Context, fn func(context.Context) error) error {
+	if tx, ok := ctx.Value(txContextKey{}).(pgx.Tx); ok && tx != nil {
+		return fmt.Errorf("postgres: WithTenantTx called inside an existing transaction")
+	}
+
+	tx, err := PoolForContext(ctx, d.Pool).BeginTx(ctx, pgx.TxOptions{
+		IsoLevel:   pgx.ReadCommitted,
+		AccessMode: pgx.ReadWrite,
+	})
+	if err != nil {
+		return fmt.Errorf("postgres: begin tenant tx: %w", err)
+	}
+
+	txCtx := context.WithValue(ctx, txContextKey{}, tx)
+
+	defer func() {
+		if p := recover(); p != nil {
+			_ = tx.Rollback(ctx)
+			panic(p)
+		}
+	}()
+
+	if err := fn(txCtx); err != nil {
+		if rbErr := tx.Rollback(ctx); rbErr != nil && !errors.Is(rbErr, pgx.ErrTxClosed) {
 			d.logger.Error("postgres: rollback failed", zap.Error(rbErr))
 		}
 		return err

@@ -217,7 +217,48 @@ type Room struct {
 	UpdatedAt     time.Time  `db:"updated_at" json:"updated_at"`
 }
 
+// ReservationStatus is the stored lifecycle state of a stay.
+//
+// Status used to be derived from the actual_check_in / actual_check_out
+// timestamps on every read, which can express only three of these six: there is
+// no timestamp that means "cancelled" or "no-show", so those bookings had to be
+// deleted outright and their revenue impact was lost with them.
+type ReservationStatus string
+
+const (
+	ReservationTentative  ReservationStatus = "tentative"
+	ReservationConfirmed  ReservationStatus = "confirmed"
+	ReservationInHouse    ReservationStatus = "in_house"
+	ReservationCheckedOut ReservationStatus = "checked_out"
+	ReservationCancelled  ReservationStatus = "cancelled"
+	ReservationNoShow     ReservationStatus = "no_show"
+)
+
+// Valid reports whether s is a known reservation status, mirroring the
+// guest_stays_status_check constraint in migration 027.
+func (s ReservationStatus) Valid() bool {
+	switch s {
+	case ReservationTentative, ReservationConfirmed, ReservationInHouse,
+		ReservationCheckedOut, ReservationCancelled, ReservationNoShow:
+		return true
+	}
+	return false
+}
+
+// ReservationStatusValues lists the accepted statuses, for error messages.
+func ReservationStatusValues() []string {
+	return []string{
+		string(ReservationTentative), string(ReservationConfirmed),
+		string(ReservationInHouse), string(ReservationCheckedOut),
+		string(ReservationCancelled), string(ReservationNoShow),
+	}
+}
+
 // GuestStay is a single booking / check-in record.
+//
+// Money: TotalAmount keeps its original meaning, the pre-tax accommodation
+// total, so every existing reader is unaffected by the fields added around it.
+// The amount actually payable is TotalAmount - DiscountAmount + TaxAmount.
 type GuestStay struct {
 	ID             uuid.UUID    `db:"id" json:"id"`
 	HotelID        uuid.UUID    `db:"hotel_id" json:"hotel_id"`
@@ -237,6 +278,33 @@ type GuestStay struct {
 	CreatedAt      time.Time    `db:"created_at" json:"created_at"`
 	UpdatedAt      time.Time    `db:"updated_at" json:"updated_at"`
 	Room           *RoomSummary `db:"-" json:"rooms,omitempty"`
+
+	// Lifecycle (migration 027). Additive: absent from older rows only in the
+	// sense that they carry the backfilled default.
+	Status             ReservationStatus `db:"status" json:"status"`
+	ConfirmationNo     *string           `db:"confirmation_no" json:"confirmation_no,omitempty"`
+	CancelledAt        *time.Time        `db:"cancelled_at" json:"cancelled_at,omitempty"`
+	CancellationReason *string           `db:"cancellation_reason" json:"cancellation_reason,omitempty"`
+	CancellationFee    float64           `db:"cancellation_fee" json:"cancellation_fee"`
+
+	// Occupancy and channel.
+	Adults       int    `db:"adults" json:"adults"`
+	Children     int    `db:"children" json:"children"`
+	ApproachType string `db:"approach_type" json:"approach_type"`
+
+	// Pricing breakdown.
+	DiscountAmount float64 `db:"discount_amount" json:"discount_amount"`
+	TaxAmount      float64 `db:"tax_amount" json:"tax_amount"`
+	PromoCode      *string `db:"promo_code" json:"promo_code,omitempty"`
+}
+
+// Payable is the amount the guest actually owes for the stay.
+func (g GuestStay) Payable() float64 {
+	base := 0.0
+	if g.TotalAmount != nil {
+		base = *g.TotalAmount
+	}
+	return base - g.DiscountAmount + g.TaxAmount
 }
 
 // RoomSummary is a lightweight projection used for enrichment.
