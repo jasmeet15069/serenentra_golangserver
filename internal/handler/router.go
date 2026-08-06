@@ -68,6 +68,7 @@ func Register(app *fiber.App, h Handlers, secret string, pool *pgxpool.Pool, c c
 				"GET /api/dashboard/stats",
 				"GET /api/dashboard/data",
 				"GET /api/rooms",
+				"GET /api/rooms/available",
 				"POST /api/rooms",
 				"PATCH /api/rooms/:id/status",
 				"POST /api/housekeeping/guest-requests",

@@ -19,6 +19,7 @@ import (
 // payment path passes DemoHotelID (its single, public tenant).
 type RoomRepository interface {
 	ListRooms(ctx context.Context, hotelID uuid.UUID, status *domain.RoomStatus) ([]domain.Room, error)
+	ListRoomsAvailableBetween(ctx context.Context, hotelID uuid.UUID, checkIn, checkOut time.Time) ([]domain.Room, error)
 	FindRoomByID(ctx context.Context, hotelID, id uuid.UUID) (*domain.Room, error)
 	FindAvailableRoom(ctx context.Context, hotelID uuid.UUID, roomType *string) (*domain.Room, error)
 	CreateRoom(ctx context.Context, hotelID uuid.UUID, r *domain.Room) (*domain.Room, error)
@@ -29,6 +30,7 @@ type RoomRepository interface {
 	CreateStay(ctx context.Context, hotelID uuid.UUID, s *domain.GuestStay) (*domain.GuestStay, error)
 	FindStayByID(ctx context.Context, hotelID, id uuid.UUID) (*domain.GuestStay, error)
 	ListStays(ctx context.Context, hotelID uuid.UUID, filters map[string]interface{}) ([]domain.GuestStay, error)
+	RoomHasActiveStay(ctx context.Context, hotelID, roomID uuid.UUID) (bool, error)
 	UpdateStay(ctx context.Context, hotelID, id uuid.UUID, fields map[string]interface{}) error
 	DeleteStay(ctx context.Context, hotelID, id uuid.UUID) error
 
@@ -59,6 +61,42 @@ func (r *roomRepository) ListRooms(ctx context.Context, hotelID uuid.UUID, statu
 	rows, err := poolFromContext(ctx, r.db.Pool).Query(ctx, q, args...)
 	if err != nil {
 		return nil, fmt.Errorf("roomRepo.ListRooms: %w", err)
+	}
+	defer rows.Close()
+	return scanRooms(rows)
+}
+
+// ListRoomsAvailableBetween returns the rooms that can be booked for
+// [checkIn, checkOut), which is a different question from ListRooms(status).
+//
+// A room's `status` describes it right now — occupied tonight, being cleaned
+// this hour. It says nothing about a stay next month, so selecting rooms by
+// status both hides rooms that are bookable later and offers rooms that are
+// already reserved for the requested dates.
+//
+// Availability is therefore the absence of an overlapping stay. Two stays
+// overlap when each starts before the other ends; checkout day is free, so the
+// comparisons are strict and a guest leaving on the 10th does not block an
+// arrival on the 10th. Only `maintenance` excludes a room outright, being the
+// one status that means the room cannot be occupied at all.
+func (r *roomRepository) ListRoomsAvailableBetween(ctx context.Context, hotelID uuid.UUID, checkIn, checkOut time.Time) ([]domain.Room, error) {
+	const q = `
+		SELECT id, hotel_id, room_number, room_type, floor, capacity, price_per_night,
+		       status, amenities, created_at, updated_at
+		FROM rooms rm
+		WHERE rm.hotel_id = $1
+		  AND rm.status <> 'maintenance'
+		  AND NOT EXISTS (
+		      SELECT 1 FROM guest_stays gs
+		      WHERE gs.hotel_id = rm.hotel_id
+		        AND gs.room_id  = rm.id
+		        AND gs.check_in_date  < $3
+		        AND gs.check_out_date > $2
+		  )
+		ORDER BY rm.floor, rm.room_number`
+	rows, err := poolFromContext(ctx, r.db.Pool).Query(ctx, q, hotelID, checkIn, checkOut)
+	if err != nil {
+		return nil, fmt.Errorf("roomRepo.ListRoomsAvailableBetween: %w", err)
 	}
 	defer rows.Close()
 	return scanRooms(rows)
@@ -308,6 +346,23 @@ func (r *roomRepository) UpdateStay(ctx context.Context, hotelID, id uuid.UUID, 
 		return ErrNotFound
 	}
 	return nil
+}
+
+// RoomHasActiveStay reports whether someone is currently in the room: a stay
+// that has been checked in and not yet checked out. Used before releasing a
+// room, so cancelling one booking cannot mark a room occupied by a different
+// guest as available.
+func (r *roomRepository) RoomHasActiveStay(ctx context.Context, hotelID, roomID uuid.UUID) (bool, error) {
+	const q = `
+		SELECT EXISTS (
+			SELECT 1 FROM guest_stays
+			WHERE hotel_id = $1 AND room_id = $2
+			  AND actual_check_in IS NOT NULL
+			  AND actual_check_out IS NULL
+		)`
+	var exists bool
+	err := poolFromContext(ctx, r.db.Pool).QueryRow(ctx, q, hotelID, roomID).Scan(&exists)
+	return exists, err
 }
 
 func (r *roomRepository) DeleteStay(ctx context.Context, hotelID, id uuid.UUID) error {

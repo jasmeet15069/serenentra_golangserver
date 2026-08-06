@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"time"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
@@ -25,6 +26,8 @@ func NewRoomHandler(rooms postgres.RoomRepository, c cache.Cache) *RoomHandler {
 
 func (h *RoomHandler) Register(r fiber.Router) {
 	r.Get("/rooms", h.List)
+	// Registered before any /rooms/:id route so "available" is never taken as an id.
+	r.Get("/rooms/available", h.ListAvailable)
 	r.Post("/rooms", h.Create)
 	r.Patch("/rooms/:id/status", h.UpdateStatus)
 	r.Patch("/rooms/:id", h.Update)
@@ -86,6 +89,41 @@ func (h *RoomHandler) List(c *fiber.Ctx) error {
 		_ = h.cache.Set(c.Context(), cacheKey, string(b), cache.TTLRoomList)
 	}
 	c.Set("X-Cache", "MISS")
+	return response.OK(c, rooms)
+}
+
+// ListAvailable (GET /api/rooms/available?check_in=&check_out=) returns the
+// rooms bookable for a date range.
+//
+// The booking wizard previously picked rooms out of GET /rooms by status ==
+// "available", which is a question about right now rather than about the
+// requested dates: a hotel whose rooms were all occupied or being cleaned
+// offered nothing to book, even for months ahead, and the wizard could not be
+// completed. Dates are required precisely so that mistake cannot recur here.
+func (h *RoomHandler) ListAvailable(c *fiber.Ctx) error {
+	const layout = "2006-01-02"
+	rawIn, rawOut := c.Query("check_in"), c.Query("check_out")
+	if rawIn == "" || rawOut == "" {
+		return response.Error(c, fiber.StatusBadRequest, "check_in and check_out are required (YYYY-MM-DD)")
+	}
+	checkIn, err := time.Parse(layout, rawIn)
+	if err != nil {
+		return response.Error(c, fiber.StatusBadRequest, "invalid check_in, expected YYYY-MM-DD")
+	}
+	checkOut, err := time.Parse(layout, rawOut)
+	if err != nil {
+		return response.Error(c, fiber.StatusBadRequest, "invalid check_out, expected YYYY-MM-DD")
+	}
+	if !checkOut.After(checkIn) {
+		return response.Error(c, fiber.StatusBadRequest, "check_out must be after check_in")
+	}
+
+	rooms, err := h.rooms.ListRoomsAvailableBetween(c.Context(), tenantHotelID(c), checkIn, checkOut)
+	if err != nil {
+		return response.Error(c, fiber.StatusInternalServerError, err.Error())
+	}
+	// Deliberately uncached: availability changes on every booking, and a stale
+	// hit here would offer a room that has just been taken.
 	return response.OK(c, rooms)
 }
 

@@ -307,7 +307,12 @@ func (h *ReservationHandler) Cancel(c *fiber.Ctx) error {
 	if err := h.roomRepo.DeleteStay(c.Context(), tenantHotelID(c), id); err != nil {
 		return response.Error(c, fiber.StatusInternalServerError, "cancel failed")
 	}
-	_ = h.roomRepo.UpdateRoomStatus(c.Context(), tenantHotelID(c), roomID, domain.RoomStatusAvailable)
+	// Only release the room if nobody is still in it. A room commonly carries a
+	// current guest plus later bookings, and cancelling one of those must not
+	// advertise an occupied room as free — which then lets it be double-booked.
+	if active, err := h.roomRepo.RoomHasActiveStay(c.Context(), tenantHotelID(c), roomID); err == nil && !active {
+		_ = h.roomRepo.UpdateRoomStatus(c.Context(), tenantHotelID(c), roomID, domain.RoomStatusAvailable)
+	}
 	return response.OK(c, map[string]string{"status": "cancelled"})
 }
 
