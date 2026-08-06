@@ -196,14 +196,25 @@ type channelAnalyticsResponse struct {
 }
 
 func (h *ChannelHandler) GetChannelAnalytics(c *fiber.Ctx) error {
+	// Reservations live in guest_stays, and the channel they came through is
+	// guest_stays.source — the field the booking wizard has always captured from
+	// its ten-channel dropdown. This read from `bookings`, which nothing writes,
+	// so the channel mix was empty for every tenant no matter how many OTA
+	// bookings they had taken.
+	//
+	// Revenue is what the guest actually owes (base less discount plus tax), not
+	// the pre-tax room total, so it matches the figure shown everywhere else.
+	// Cancelled stays are excluded: a cancelled booking earned the channel
+	// nothing.
 	rows, err := tenantPool(c, h.pool).Query(c.Context(), `
 		SELECT
-			COALESCE(channel_name, 'direct') AS channel_name,
+			COALESCE(NULLIF(gs.source, ''), 'Direct') AS channel_name,
 			COUNT(*) AS bookings,
-			COALESCE(SUM(b.total), 0) AS revenue
-		FROM bookings b
-		WHERE b.hotel_id = $1
-		  AND b.created_at >= CURRENT_DATE - INTERVAL '30 days'
+			COALESCE(SUM(COALESCE(gs.total_amount, 0) - gs.discount_amount + gs.tax_amount), 0) AS revenue
+		FROM guest_stays gs
+		WHERE gs.hotel_id = $1
+		  AND gs.status <> 'cancelled'
+		  AND gs.created_at >= CURRENT_DATE - INTERVAL '30 days'
 		GROUP BY channel_name
 		ORDER BY revenue DESC`,
 		tenantHotelID(c),
