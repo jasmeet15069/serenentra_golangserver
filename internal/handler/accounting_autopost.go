@@ -34,6 +34,10 @@ var standardChart = []defaultAccount{
 	{"4000", "Sales Revenue", "revenue", "operating_revenue", 8},
 	{"4100", "Food & Beverage Revenue", "revenue", "operating_revenue", 9},
 	{"5000", "Cost of Goods Sold", "expense", "cogs", 10},
+	// OTA commission is a cost of distribution, not a cost of goods. Booking it
+	// to 5000 inflates COGS and so understates gross margin — the F&B food-cost
+	// line would carry Booking.com's fee. It needs its own account.
+	{"5100", "Channel Commission", "expense", "selling_expense", 11},
 }
 
 // ensureChartOfAccounts inserts any missing standard accounts and returns a
@@ -246,11 +250,29 @@ func reverseJournalsByReference(ctx context.Context, pool postgres.Querier, hote
 	if len(src) == 0 {
 		return uuid.Nil, nil
 	}
+	// The reversal is numbered like any other posting. It was previously
+	// inserted with no voucher_no at all, which defeats the point of the voucher
+	// series: given a ledger line you must be able to name the document behind
+	// it, and a correction is exactly the line someone will need to trace.
+	//
+	// The type derives from the original reference, so a sales reversal lands in
+	// the SAL series alongside the sale it cancels rather than in GEN. As in
+	// postJournal, a numbering failure logs and posts unnumbered rather than
+	// dropping the entry — an unnumbered correction is repairable, a ledger left
+	// unbalanced is not.
+	revReference := reference + " REV"
+	vType := voucherTypeFor(reference)
+	voucherNo, vErr := nextVoucherNo(ctx, pool, hotelID, vType)
+	if vErr != nil {
+		log.Printf("accounting: voucher numbering failed for reversal of %s (%s): %v — posting unnumbered",
+			reference, vType, vErr)
+	}
+
 	entryID := uuid.New()
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO accounting_journal_entries (id, hotel_id, entry_date, description, reference, created_at)
-		VALUES ($1,$2,CURRENT_DATE,$3,$4,now())`,
-		entryID, hotelID, description, reference+" REV"); err != nil {
+		INSERT INTO accounting_journal_entries (id, hotel_id, entry_date, description, reference, voucher_no, voucher_type, created_at)
+		VALUES ($1,$2,CURRENT_DATE,$3,$4,NULLIF($5,''),$6,now())`,
+		entryID, hotelID, description, revReference, voucherNo, vType); err != nil {
 		return uuid.Nil, err
 	}
 	for _, r := range src {

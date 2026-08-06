@@ -430,7 +430,7 @@ func (h *ChannelIngestHandler) process(
 			if _, cmErr := postJournal(txCtx, db, cc.HotelID,
 				fmt.Sprintf("%s commission — %s", cc.Name, externalRef),
 				"COMM "+confirmationNo, []journalLine{
-					{accountCode: "5000", debit: commission, memo: cc.Name + " commission"},
+					{accountCode: "5100", debit: commission, memo: cc.Name + " commission"},
 					{accountCode: "2000", credit: commission, memo: "Payable to " + cc.Name},
 				}); cmErr != nil {
 				return fmt.Errorf("ota commission: %w", cmErr)
@@ -515,6 +515,27 @@ func (h *ChannelIngestHandler) Cancel(c *fiber.Ctx) error {
 	// would advertise an occupied room as available.
 	if active, aErr := h.roomRepo.RoomHasActiveStay(ctx, cc.HotelID, stay.RoomID); aErr == nil && !active {
 		_ = h.roomRepo.UpdateRoomStatus(ctx, cc.HotelID, stay.RoomID, domain.RoomStatusAvailable)
+	}
+
+	// Reverse the postings, or the cancelled booking leaves a receivable nobody
+	// will ever collect sitting on the balance sheet for good — and a commission
+	// payable to a channel that earned nothing.
+	//
+	// Reversed, never deleted: a posted entry is cancelled by an equal-and-
+	// opposite one so the audit trail survives and the net effect is zero. Both
+	// legs are reversed, the sale and the commission.
+	if confirmation := derefStr(stay.ConfirmationNo); confirmation != "" {
+		db := h.db.Querier(ctx)
+		for _, ref := range []string{"FOLIO " + confirmation, "COMM " + confirmation} {
+			if _, revErr := reverseJournalsByReference(ctx, db, cc.HotelID, ref,
+				fmt.Sprintf("%s cancellation — %s", cc.Name, externalRef)); revErr != nil {
+				// The cancellation itself has already committed and must stand.
+				// Log loudly rather than failing it: an unreversed entry is
+				// repairable, a room left held for a guest who cancelled is not.
+				log.Printf("channel: LEDGER REVERSAL FAILED for %s (%s): %v — booking cancelled, journal still standing",
+					ref, externalRef, revErr)
+			}
+		}
 	}
 
 	_, _ = h.pool.Exec(ctx, `
