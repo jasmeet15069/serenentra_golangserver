@@ -101,6 +101,33 @@ VM (it is bound to loopback; the public `/api/health` answers 401).
 Newest first. "Safe to revert alone" means reverting the code needs no database
 change.
 
+### v6 — `47ac13c` · OTA commission account and cancellation reversal
+2026-08-06 · API only
+
+Commission moves from `5000` Cost of Goods Sold to a new `5100` Channel
+Commission. Cancelling an OTA booking now reverses both the sale and the
+commission. Reversals are voucher-numbered, which they never were.
+
+Both defects were found by running a signed Booking.com delivery end to end
+against production and then removing every trace of it — neither is visible from
+reading the code.
+
+**Revert:** `git revert 47ac13c`, then ship.
+
+**Database:** `5100 Channel Commission` is seeded into `accounting_accounts` by
+`ensureChartOfAccounts` on the first posting. Reverting the code leaves the
+account; it is harmless and unused. Do **not** delete it if anything has posted
+to it — the journal lines reference it.
+
+⚠️ **Reverting reinstates the two defects.** Commission returns to COGS, and
+cancelled OTA bookings again leave an uncollectable receivable standing.
+
+⚠️ Commission already posted to `5100` before a revert stays there. It does not
+migrate back to `5000`, and it should not — moving posted entries between
+accounts rewrites history. Leave them and note the changeover date.
+
+---
+
 ### v5 — `665f528` · docs: night-audit fix and OTA ingestion
 2026-08-06 · docs only
 

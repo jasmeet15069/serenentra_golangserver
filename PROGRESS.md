@@ -10,7 +10,7 @@ into the ledger, promo codes, restaurant room charges linked to the folio).
 
 | Repo | HEAD | GitHub | Production VM |
 |---|---|---|---|
-| `serenentra_golangserver` | `c995e88` | ✅ pushed | ✅ deployed, health 200 |
+| `serenentra_golangserver` | `47ac13c` | ✅ pushed | ✅ deployed, health 200 |
 | `HmsAdminStaffPortal` | `6c42443` | ✅ pushed | ✅ deployed, `/reservations/new` 200 |
 | `superadmin_serenentra` | `f351fe7` | ✅ pushed | ✅ Vercel, login verified 200 |
 | `serenentra-landing` | unchanged | — | — |
@@ -198,13 +198,47 @@ resolver POS and the front desk use. Commission books separately as an expense
 and a payable — netting it would understate both revenue and the cost of
 distribution.
 
-Verified on production that the routes are live and correctly gated: an unknown
-connection returns `unauthorized channel` rather than `authentication is
-required`, which is the proof the webhook's own signature check is running and
-not the auth gate. **The full booking path has not been exercised against
-production**, deliberately — doing so writes a reservation, a customer, journal
-entries and consumes a voucher number, and the cleanup lesson below says that is
-worth doing on purpose rather than as a smoke test.
+### Verified end to end on production
+
+A signed Booking.com delivery was run through the whole chain and then removed.
+
+```
+forged signature                    -> 401 unauthorized channel
+signed delivery                     -> 201 processed
+  SAL-000006  Dr 1200 AR               18,000.00
+                Cr 4000 Room Revenue           15,254.24
+                Cr 2100 GST Payable             2,745.76
+  GEN-000001  Dr 5100 Commission        1,800.00
+                Cr 2000 Payable                 1,800.00
+redelivery, identical payload       -> 200 duplicate, SAME reservation id
+cancellation                        -> 200 cancelled
+```
+
+Guest recorded in CRM, accounting customer created with the phone normalised
+(`+91 98765 00111` → `9876500111`), reservation stamped `source=Booking.com`,
+`approach_type=ota`.
+
+**Cleanup verified exact.** Row counts, the voucher counter (`SAL` back to 6,
+the probe's `GEN` row removed) and the trial balance were all restored to their
+prior values — `net 0.00`, 12 journal lines, the same as before the probe.
+
+### Two defects the live run exposed
+
+Neither was visible from reading the code, which is the argument for running the
+probe at all.
+
+- **Commission booked to `5000` Cost of Goods Sold**, the only expense account
+  the chart had. An OTA fee is a cost of distribution, not of goods: it inflated
+  COGS, understated gross margin, and put Booking.com's fee on the F&B food-cost
+  line. Now `5100 Channel Commission`.
+- **Cancelling left the postings standing**, so a cancelled booking kept an
+  uncollectable receivable on the balance sheet permanently, plus a payable to a
+  channel that had earned nothing. Cancel now reverses both legs — reversed,
+  never deleted.
+- While wiring that up: `reverseJournalsByReference` inserted its reversal with
+  no `voucher_no`, so every correction ever posted was unnumbered. A correction
+  is precisely the line someone needs to trace. Now numbered, in the series of
+  the entry it reverses.
 
 ---
 
