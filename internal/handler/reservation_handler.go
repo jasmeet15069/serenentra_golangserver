@@ -47,6 +47,41 @@ func (h *ReservationHandler) inTx(ctx context.Context, fn func(context.Context) 
 	return h.db.WithTenantTx(ctx, fn)
 }
 
+// Who may work the front desk, and who may overrule it.
+//
+// The module had no role check of any kind: every endpoint below was reachable
+// by any authenticated account, so a housekeeping or waiter login could read
+// every guest's name, email and phone, create bookings, and check people in and
+// out. The only thing in the way was the feature-matrix gate, which is
+// default-on and fail-open by design and so denies nothing until a superadmin
+// turns something off.
+//
+// The split follows what the desk actually does. Reception runs the operational
+// day — booking, quoting, arrivals, departures, amendments. Cancelling and
+// walking a guest out with money still owed both move revenue, so they carry
+// manager oversight, which is what the brief's "linked to Manager-level
+// permissions and oversight" asks for.
+var (
+	frontDeskRoles = []string{
+		"platform_admin", "super_admin", "admin", "hotel_admin",
+		"property_manager", "receptionist",
+	}
+	frontDeskManagerRoles = []string{
+		"platform_admin", "super_admin", "admin", "hotel_admin", "property_manager",
+	}
+)
+
+// requireFrontDesk allows the reception desk and anyone above it.
+func (h *ReservationHandler) requireFrontDesk(c *fiber.Ctx) bool {
+	return requireAnyRoleFromToken(c, h.cfg.Auth.AccessTokenSecret, frontDeskRoles...)
+}
+
+// requireFrontDeskManager allows only manager level and above, for the actions
+// that move money.
+func (h *ReservationHandler) requireFrontDeskManager(c *fiber.Ctx) bool {
+	return requireAnyRoleFromToken(c, h.cfg.Auth.AccessTokenSecret, frontDeskManagerRoles...)
+}
+
 func (h *ReservationHandler) Register(r fiber.Router) {
 	r.Get("/reservations", h.List)
 	r.Get("/reservations/calendar", h.Calendar)
@@ -60,6 +95,9 @@ func (h *ReservationHandler) Register(r fiber.Router) {
 }
 
 func (h *ReservationHandler) List(c *fiber.Ctx) error {
+	if !h.requireFrontDesk(c) {
+		return nil
+	}
 	status := c.Query("status")
 	search := c.Query("search")
 	from := c.Query("from")
@@ -143,6 +181,9 @@ func (h *ReservationHandler) List(c *fiber.Ctx) error {
 }
 
 func (h *ReservationHandler) Get(c *fiber.Ctx) error {
+	if !h.requireFrontDesk(c) {
+		return nil
+	}
 	id, err := uuid.Parse(c.Params("id"))
 	if err != nil {
 		return response.Error(c, fiber.StatusBadRequest, "invalid id")
@@ -171,6 +212,13 @@ type createReservationRequest struct {
 	ApproachType   string `json:"approach_type"`
 	DurationNights int    `json:"duration_nights"`
 	PromoCode      string `json:"promo_code"`
+
+	// Arrival and departure times, "HH:MM". The columns have always been
+	// timestamptz and every write put midnight in them, so a same-day turnover
+	// read as the departing guest still occupying the room until the end of the
+	// day. Optional — omitted means midnight, exactly as before.
+	CheckInTime  string `json:"check_in_time"`
+	CheckOutTime string `json:"check_out_time"`
 
 	// Identity, stored on the CRM guest record.
 	IDType   string `json:"id_type"`
@@ -292,10 +340,36 @@ func resolveStayDates(req createReservationRequest) (time.Time, time.Time, error
 		return time.Time{}, time.Time{}, fmt.Errorf("check_out_date or duration_nights is required")
 	}
 
+	// Apply the times last, so the duration arithmetic above stays whole days —
+	// a 14:00 arrival and a 3-night stay is still a 3-night stay, not 3 days
+	// and 14 hours rounded somewhere unhelpful.
+	if checkIn, err = applyClockTime(checkIn, req.CheckInTime); err != nil {
+		return time.Time{}, time.Time{}, fmt.Errorf("invalid check_in_time: %w", err)
+	}
+	if checkOut, err = applyClockTime(checkOut, req.CheckOutTime); err != nil {
+		return time.Time{}, time.Time{}, fmt.Errorf("invalid check_out_time: %w", err)
+	}
+
 	if !checkOut.After(checkIn) {
 		return time.Time{}, time.Time{}, fmt.Errorf("check_out must be after check_in")
 	}
 	return checkIn, checkOut, nil
+}
+
+// applyClockTime sets the time-of-day on a date from "HH:MM".
+//
+// An empty value leaves midnight, which is what every reservation written
+// before this carried, so nothing existing shifts.
+func applyClockTime(day time.Time, clock string) (time.Time, error) {
+	clock = strings.TrimSpace(clock)
+	if clock == "" {
+		return day, nil
+	}
+	t, err := time.Parse("15:04", clock)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("use HH:MM, got %q", clock)
+	}
+	return time.Date(day.Year(), day.Month(), day.Day(), t.Hour(), t.Minute(), 0, 0, day.Location()), nil
 }
 
 // newConfirmationNo produces the reference staff and guests quote on the phone.
@@ -320,6 +394,9 @@ func isOverlapViolation(err error) bool {
 }
 
 func (h *ReservationHandler) Create(c *fiber.Ctx) error {
+	if !h.requireFrontDesk(c) {
+		return nil
+	}
 	var req createReservationRequest
 	if err := c.BodyParser(&req); err != nil {
 		return response.Error(c, fiber.StatusBadRequest, "invalid request body")
@@ -540,6 +617,9 @@ func (h *ReservationHandler) Create(c *fiber.Ctx) error {
 }
 
 func (h *ReservationHandler) Update(c *fiber.Ctx) error {
+	if !h.requireFrontDesk(c) {
+		return nil
+	}
 	id, err := uuid.Parse(c.Params("id"))
 	if err != nil {
 		return response.Error(c, fiber.StatusBadRequest, "invalid id")
@@ -646,6 +726,9 @@ func (h *ReservationHandler) Update(c *fiber.Ctx) error {
 }
 
 func (h *ReservationHandler) Cancel(c *fiber.Ctx) error {
+	if !h.requireFrontDeskManager(c) {
+		return nil
+	}
 	id, err := uuid.Parse(c.Params("id"))
 	if err != nil {
 		return response.Error(c, fiber.StatusBadRequest, "invalid id")
@@ -690,6 +773,9 @@ func (h *ReservationHandler) Cancel(c *fiber.Ctx) error {
 }
 
 func (h *ReservationHandler) CheckIn(c *fiber.Ctx) error {
+	if !h.requireFrontDesk(c) {
+		return nil
+	}
 	id, err := uuid.Parse(c.Params("id"))
 	if err != nil {
 		return response.Error(c, fiber.StatusBadRequest, "invalid id")
@@ -758,6 +844,9 @@ func (h *ReservationHandler) CheckIn(c *fiber.Ctx) error {
 }
 
 func (h *ReservationHandler) CheckOut(c *fiber.Ctx) error {
+	if !h.requireFrontDesk(c) {
+		return nil
+	}
 	id, err := uuid.Parse(c.Params("id"))
 	if err != nil {
 		return response.Error(c, fiber.StatusBadRequest, "invalid id")
@@ -869,6 +958,9 @@ func (h *ReservationHandler) CheckOut(c *fiber.Ctx) error {
 }
 
 func (h *ReservationHandler) Calendar(c *fiber.Ctx) error {
+	if !h.requireFrontDesk(c) {
+		return nil
+	}
 	month := c.Query("month", time.Now().Format("2006-01"))
 	start, err := time.Parse("2006-01", month)
 	if err != nil {
@@ -957,6 +1049,9 @@ func priceStay(roomRate float64, checkIn, checkOut time.Time, taxRate, discount 
 // can show a total it did not invent. It is a POST because it takes a body, not
 // because it changes state — nothing is written.
 func (h *ReservationHandler) Quote(c *fiber.Ctx) error {
+	if !h.requireFrontDesk(c) {
+		return nil
+	}
 	var req createReservationRequest
 	if err := c.BodyParser(&req); err != nil {
 		return response.Error(c, fiber.StatusBadRequest, "invalid request body")

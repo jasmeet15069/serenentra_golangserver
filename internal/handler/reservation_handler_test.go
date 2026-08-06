@@ -170,6 +170,87 @@ func TestDeriveReservationStatus(t *testing.T) {
 	}
 }
 
+// Arrival and departure times. The columns were always timestamptz and every
+// write put midnight in them, so a same-day turnover read as the departing
+// guest still holding the room until the end of the day.
+func TestResolveStayDatesWithClockTimes(t *testing.T) {
+	t.Run("times are applied to the right days", func(t *testing.T) {
+		in, out, err := resolveStayDates(createReservationRequest{
+			CheckInDate: "2026-08-10", DurationNights: 2,
+			CheckInTime: "14:30", CheckOutTime: "11:00",
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got := in.Format("2006-01-02 15:04"); got != "2026-08-10 14:30" {
+			t.Errorf("check_in = %s, want 2026-08-10 14:30", got)
+		}
+		if got := out.Format("2006-01-02 15:04"); got != "2026-08-12 11:00" {
+			t.Errorf("check_out = %s, want 2026-08-12 11:00", got)
+		}
+	})
+
+	t.Run("duration stays in whole nights regardless of the arrival time", func(t *testing.T) {
+		// A 14:00 arrival on a 3-night stay is still 3 nights — the time must
+		// not push the departure into a fourth day.
+		in, out, err := resolveStayDates(createReservationRequest{
+			CheckInDate: "2026-08-10", DurationNights: 3, CheckInTime: "14:00",
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got := out.Format("2006-01-02"); got != "2026-08-13" {
+			t.Errorf("check_out date = %s, want 2026-08-13", got)
+		}
+		if in.Hour() != 14 {
+			t.Errorf("check_in hour = %d, want 14", in.Hour())
+		}
+	})
+
+	t.Run("omitted times leave midnight, as every existing row has", func(t *testing.T) {
+		in, out, err := resolveStayDates(createReservationRequest{
+			CheckInDate: "2026-08-10", CheckOutDate: "2026-08-12",
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if in.Hour() != 0 || in.Minute() != 0 || out.Hour() != 0 || out.Minute() != 0 {
+			t.Errorf("expected midnight on both ends, got %s and %s", in, out)
+		}
+	})
+
+	t.Run("a same-day turnover no longer collides", func(t *testing.T) {
+		// Departure 11:00, next arrival 14:00 on the same date. The overlap
+		// constraint is a half-open tstzrange, so these must not intersect.
+		_, leaving, _ := resolveStayDates(createReservationRequest{
+			CheckInDate: "2026-08-08", CheckOutDate: "2026-08-10", CheckOutTime: "11:00",
+		})
+		arriving, _, _ := resolveStayDates(createReservationRequest{
+			CheckInDate: "2026-08-10", CheckOutDate: "2026-08-12", CheckInTime: "14:00",
+		})
+		if !arriving.After(leaving) {
+			t.Errorf("arrival %s is not after departure %s — same-day turnover would collide", arriving, leaving)
+		}
+	})
+
+	t.Run("a malformed time is refused, not ignored", func(t *testing.T) {
+		if _, _, err := resolveStayDates(createReservationRequest{
+			CheckInDate: "2026-08-10", DurationNights: 1, CheckInTime: "2pm",
+		}); err == nil {
+			t.Error("expected an error for a non HH:MM time")
+		}
+	})
+
+	t.Run("a check-out time that inverts the stay is refused", func(t *testing.T) {
+		if _, _, err := resolveStayDates(createReservationRequest{
+			CheckInDate: "2026-08-10", CheckOutDate: "2026-08-10",
+			CheckInTime: "14:00", CheckOutTime: "11:00",
+		}); err == nil {
+			t.Error("expected an error when check-out lands before check-in")
+		}
+	})
+}
+
 // One calculation feeds both the quote endpoint and Create, which is the whole
 // point: the wizard used to hardcode 18% GST, display a total including it, and
 // send nothing, so the guest agreed to one number and the database stored
