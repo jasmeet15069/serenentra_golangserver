@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"math"
@@ -1059,19 +1060,44 @@ func (h *POSHandler) AddBillPayment(c *fiber.Ctx) error {
 		credited = req.Amount // amount already excludes change (tendered - change)
 	}
 
-	// Mirror the payment into the main `payments` table so restaurant revenue is
-	// visible on the dashboard. The dashboard (dashboard_repository.go) reads
-	// revenue from `payments`, NOT `bill_payments`, so dine-in sales were invisible
-	// in revenue_today / the revenue trend / the department breakdown. category
-	// 'fnb' feeds the F&B slice; status 'completed' makes revenue_today count it.
-	// In-tx so it is atomic with the bill payment — a bill payment that recorded
-	// must also show as revenue, and vice-versa. No double-count: `bill_payments`
-	// is never summed for reporting (only read per-single-bill for the receipt).
-	if _, err := tx.Exec(ctx, `
-		INSERT INTO payments (id, hotel_id, payment_number, amount, payment_method, status, processed_by, notes, category, created_at)
-		VALUES ($1,$2,$3,$4,$5,'completed',$6,$7,'fnb',now())`,
-		uuid.New(), hotelID, paymentNumber, credited, req.Method, h.userID(c), "Dine-in bill "+b.BillNumber); err != nil {
-		return response.Error(c, fiber.StatusInternalServerError, "failed to record revenue: "+err.Error())
+	// A room charge collects nothing now — the guest signs and pays at the desk
+	// — so it goes onto their folio instead of being recorded as money received.
+	// Both halves of that matter:
+	//
+	//   - without the folio line the charge never reached the guest's bill and
+	//     check-out never asked for it, so the meal was simply never billed;
+	//   - with a `payments` row it was counted as collected on the day it was
+	//     signed for, and counted again when the guest settled at check-out.
+	//
+	// In-tx with the bill payment, so a folio charge cannot exist without its
+	// bill payment or the reverse.
+	if req.Method == "room_charge" {
+		folioID, _, fErr := resolveFolioForRoomCharge(ctx, tx, hotelID, b.SessionID)
+		if fErr != nil {
+			if errors.Is(fErr, errNoRoomForCharge) {
+				return response.Error(c, fiber.StatusUnprocessableEntity, fErr.Error())
+			}
+			return response.Error(c, fiber.StatusInternalServerError, fErr.Error())
+		}
+		if pErr := postFolioCharge(ctx, tx, hotelID, folioID, b.ID,
+			"Restaurant — bill "+b.BillNumber, b.Subtotal, b.TaxAmount, h.userID(c)); pErr != nil {
+			return response.Error(c, fiber.StatusInternalServerError, pErr.Error())
+		}
+	} else {
+		// Mirror the payment into the main `payments` table so restaurant revenue is
+		// visible on the dashboard. The dashboard (dashboard_repository.go) reads
+		// revenue from `payments`, NOT `bill_payments`, so dine-in sales were invisible
+		// in revenue_today / the revenue trend / the department breakdown. category
+		// 'fnb' feeds the F&B slice; status 'completed' makes revenue_today count it.
+		// In-tx so it is atomic with the bill payment — a bill payment that recorded
+		// must also show as revenue, and vice-versa. No double-count: `bill_payments`
+		// is never summed for reporting (only read per-single-bill for the receipt).
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO payments (id, hotel_id, payment_number, amount, payment_method, status, processed_by, notes, category, created_at)
+			VALUES ($1,$2,$3,$4,$5,'completed',$6,$7,'fnb',now())`,
+			uuid.New(), hotelID, paymentNumber, credited, req.Method, h.userID(c), "Dine-in bill "+b.BillNumber); err != nil {
+			return response.Error(c, fiber.StatusInternalServerError, "failed to record revenue: "+err.Error())
+		}
 	}
 
 	b.AmountPaid = round2(b.AmountPaid + credited)

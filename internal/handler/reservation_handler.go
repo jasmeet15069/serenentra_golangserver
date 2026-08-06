@@ -775,6 +775,23 @@ func (h *ReservationHandler) CheckOut(c *fiber.Ctx) error {
 		return response.Error(c, fiber.StatusConflict, "reservation is already checked out")
 	}
 
+	// A guest must not walk out owing money. Restaurant bills signed to the room
+	// land on the folio, and nothing used to read that balance at check-out —
+	// so every meal charged to a room was simply never collected.
+	//
+	// Overridable, because a company-billed stay legitimately departs with an
+	// open balance that is invoiced later. The override is explicit rather than
+	// the default, so the desk has to mean it.
+	outstanding, folioID, balErr := folioOutstanding(c.Context(), h.db.Querier(c.Context()), hotelID, id)
+	if balErr != nil {
+		return response.Error(c, fiber.StatusInternalServerError, "failed to read folio balance")
+	}
+	if outstanding > 0 && !strings.EqualFold(c.Query("allow_outstanding"), "true") {
+		return response.Error(c, fiber.StatusConflict, fmt.Sprintf(
+			"folio has an outstanding balance of %.2f — settle it, or pass allow_outstanding=true to bill it later",
+			outstanding))
+	}
+
 	now := time.Now().UTC()
 	err = h.inTx(c.Context(), func(ctx context.Context) error {
 		if uErr := h.roomRepo.UpdateStay(ctx, hotelID, id, map[string]interface{}{
@@ -783,7 +800,35 @@ func (h *ReservationHandler) CheckOut(c *fiber.Ctx) error {
 		}); uErr != nil {
 			return uErr
 		}
-		return h.roomRepo.UpdateRoomStatus(ctx, hotelID, existing.RoomID, domain.RoomStatusCleaning)
+		if rErr := h.roomRepo.UpdateRoomStatus(ctx, hotelID, existing.RoomID, domain.RoomStatusCleaning); rErr != nil {
+			return rErr
+		}
+		// Close the folio behind the guest so no further charge can be signed
+		// to a room whose occupant has left.
+		if folioID != uuid.Nil {
+			if _, cErr := h.db.Querier(ctx).Exec(ctx,
+				`UPDATE folios SET status = 'closed', closed_at = now()
+				  WHERE id = $1 AND hotel_id = $2 AND status = 'open'`, folioID, hotelID); cErr != nil {
+				return cErr
+			}
+		}
+		// The departure is what housekeeping works from. The room was being set
+		// to 'cleaning' with no task raised, so nothing ever appeared on their
+		// board and the room sat dirty until someone noticed.
+		if _, hErr := h.db.Querier(ctx).Exec(ctx, `
+			INSERT INTO housekeeping_assignments
+			       (id, hotel_id, room_id, task_type, priority, status, notes, created_at)
+			SELECT $1, $2, $3, 'checkout_clean', 'normal', 'pending', $4, now()
+			 WHERE NOT EXISTS (
+			     SELECT 1 FROM housekeeping_assignments
+			      WHERE hotel_id = $2 AND room_id = $3
+			        AND task_type = 'checkout_clean' AND status IN ('pending','in_progress')
+			 )`,
+			uuid.New(), hotelID, existing.RoomID,
+			"Departure — "+existing.GuestName); hErr != nil {
+			return hErr
+		}
+		return nil
 	})
 	if err != nil {
 		if errors.Is(err, postgres.ErrNotFound) {

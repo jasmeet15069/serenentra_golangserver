@@ -50,6 +50,14 @@ SELECT a.id            AS stay_a,
 -- with an arrival on the 10th -- matching ListRoomsAvailableBetween, whose
 -- overlap comparisons are strict for the same reason.
 --
+-- tstzrange over the raw columns, NOT daterange(check_in_date::date, ...).
+-- The columns are timestamptz and casting timestamptz to date is only STABLE,
+-- not IMMUTABLE, because the result depends on the session TimeZone -- so
+-- Postgres refuses it in an index expression with "functions in index
+-- expression must be marked IMMUTABLE". tstzrange of two timestamptz values is
+-- immutable and describes the real interval, which is the more precise
+-- comparison anyway.
+--
 -- Cancelled stays are excluded: a cancelled booking must not hold inventory,
 -- and the room has to be resellable for those dates immediately.
 --
@@ -64,10 +72,13 @@ ALTER TABLE guest_stays DROP CONSTRAINT IF EXISTS guest_stays_no_overlap;
 ALTER TABLE guest_stays ADD CONSTRAINT guest_stays_no_overlap
   EXCLUDE USING gist (
     room_id WITH =,
-    daterange(check_in_date::date, check_out_date::date, '[)') WITH &&
+    tstzrange(check_in_date, check_out_date, '[)') WITH &&
   ) WHERE (status <> 'cancelled');
 
 COMMIT;
+
+-- Applied to production 2026-08-06. The audit above returned 0 rows first, and
+-- a rehearsed overlapping insert was refused with 23P01 and rolled back.
 
 -- --- Rollback --------------------------------------------------------------
 -- ALTER TABLE guest_stays DROP CONSTRAINT IF EXISTS guest_stays_no_overlap;
