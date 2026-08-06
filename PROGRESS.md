@@ -1,8 +1,8 @@
 # Serenentra — Platform Progress
 
 Living record of what has been built, what is deployed, and what remains.
-Last updated: 2026-08-06 (superadmin audit; backup persistence; reservation
-wizard fixed).
+Last updated: 2026-08-06 (front-office reservation module: walk-in settlement
+into the ledger, promo codes, restaurant room charges linked to the folio).
 
 ---
 
@@ -10,8 +10,8 @@ wizard fixed).
 
 | Repo | HEAD | GitHub | Production VM |
 |---|---|---|---|
-| `serenentra_golangserver` | `d9f81c5` | ✅ pushed | ✅ deployed, health 200 |
-| `HmsAdminStaffPortal` | `571dc83` | ✅ pushed | ✅ deployed, `/reservations/new` 200 |
+| `serenentra_golangserver` | `e03f2e1` | ✅ pushed | ✅ deployed, health 200 |
+| `HmsAdminStaffPortal` | `6c42443` | ✅ pushed | ✅ deployed, `/reservations/new` 200 |
 | `superadmin_serenentra` | `f351fe7` | ✅ pushed | ✅ Vercel, login verified 200 |
 | `serenentra-landing` | unchanged | — | — |
 
@@ -19,6 +19,109 @@ All five containers healthy: `api`, `portal`, `superadmin`, `postgres`, `redis`.
 
 Both code repos are deployed at the HEAD shown. Documentation-only commits
 after these (including this file) ship no code and need no redeploy.
+
+> This table went stale once, listing `d9f81c5` while three commits had already
+> shipped past it. Update it in the same commit as the work, not afterwards.
+
+---
+
+## Front office — reservation module (2026-08-06)
+
+Analysis and plan: `FRONT_OFFICE_ANALYSIS.md`, `FRONT_OFFICE_ENHANCEMENT_PLAN.md`.
+
+Walk-in and manual reservations are one form. Submitting it with payment writes
+the CRM guest and ID proof, the accounting customer, the reservation, the
+payment, the sales invoice, and the ledger entry with its voucher — in one
+transaction. Room revenue reaches the books for the first time; previously only
+POS posted.
+
+Nothing was reimplemented. The customer resolver is the POS one, so a guest who
+ate in the restaurant and then books a room is one customer. Posting goes
+through `postJournal`, and a `FOLIO <confirmation>` reference already mapped to
+the `SAL` series, so room revenue joined the same numbered sequence as POS bills
+without that mapping changing. Room revenue books to 4000, distinct from 4100
+F&B.
+
+### The transaction seam
+
+`poolFromContext` now returns a `Querier` that both `*pgxpool.Pool` and `pgx.Tx`
+satisfy, and `WithTenantTx` puts the transaction in the context — so every
+existing repository method enlists unchanged, with none of its SQL moved. The
+accounting and promo helpers took the same parameter change and needed no
+call-site edits.
+
+`WithTx` had a related bug: it began on the shared pool regardless of context,
+so for a dedicated-database tenant it would have committed to the wrong
+database.
+
+### Restaurant → folio → check-out
+
+A dine-in bill charged to a room collects nothing at the table, yet settlement
+wrote no `folio_charge` — so the meal never reached the guest's bill and
+check-out never asked for it — *and* mirrored a row into `payments`, which
+`reports/revenue` sums as collections, so the same charge counted once when
+signed and again when the guest actually paid.
+
+Room charges now post to the folio, skip the `payments` mirror, and are
+idempotent on the bill id. A charge is refused unless the table is linked to a
+stay that is checked in and not yet departed. Check-out refuses on an
+outstanding balance (`allow_outstanding=true` for company billing), closes the
+folio, and raises the housekeeping task the departure never used to create.
+
+### Pricing and promo codes
+
+One `priceStay` serves the new `POST /reservations/quote` and create. The wizard
+hardcoded 18% GST, displayed a total including it and sent neither, so the guest
+agreed to one figure and the database stored another on every booking. The rate
+is now `hotels.gst_rate`; an unconfigured tenant is quoted no tax rather than a
+guess.
+
+Promo rules lived only inside `ValidatePromo` and are now shared, with
+`min_nights` / `min_amount` / `max_discount` — columns `promotions` always had —
+enforced. Redemption puts the limit inside the `UPDATE`, so two desks cannot
+over-redeem the last use.
+
+### Double-booking is now impossible, not merely checked
+
+The handler's read-then-write pre-check could be beaten by two concurrent
+requests, and was bypassed entirely by `/api/tables/:table`, which inserts into
+`guest_stays` directly. `guest_stays_no_overlap` was applied to production after
+the audit returned zero rows; a rehearsed overlapping insert was refused with
+`23P01` and rolled back. The handler keeps its friendly pre-check and maps
+`23P01` to the same 409.
+
+It uses `tstzrange(check_in_date, check_out_date, '[)')`, **not**
+`daterange(check_in_date::date, …)`: the columns are `timestamptz` and that cast
+is only STABLE, so Postgres rejects it in an index expression with *"functions
+in index expression must be marked IMMUTABLE"*.
+
+Applied by `scripts/add_guest_stays_overlap_constraint.sql`, deliberately not by
+a migration — it validates the whole table on creation, and on a database with
+existing overlaps that failure would abort API start-up.
+
+### Also fixed
+
+- `POST /booking/search` selected `rooms.max_guests` and `rooms.base_rate`.
+  Neither exists in any migration or in `schema.go`, so the endpoint had never
+  returned anything but `42703`. It and `/booking/availability` also excluded on
+  `bookings`, which nothing writes, so the booking engine offered rooms the
+  front desk had already sold. Both now read `guest_stays`.
+- Cancelling hard-deleted the row, destroying the only evidence the booking
+  existed. It now records status, reason, fee, timestamp and actor. The list
+  still hides cancelled bookings by default, because deletion meant they were
+  never visible.
+- `PATCH` re-validated nothing: dates could be moved onto an occupied room, and
+  `total_amount` was never recomputed, so extending a two-night stay to seven
+  kept the two-night price.
+- Check-in could be repeated, overwriting when the guest arrived, and worked on
+  a cancelled booking.
+- Guest notifications hardcoded "Grand Hotel Mumbai" for every tenant, and the
+  booking confirmation was sent at check-in rather than at booking.
+- Card capture is last four digits only. The API refuses a longer value rather
+  than truncating it, because truncating would mean the full number had already
+  been transmitted into the request logs and every `pg_dump`.
+  `payments_card_last4_check` enforces the same rule at the column, so
+  `/api/tables/:table` cannot store one either.
 
 ---
 
