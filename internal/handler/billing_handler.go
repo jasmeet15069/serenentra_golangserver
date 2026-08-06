@@ -338,7 +338,10 @@ func (h *BillingHandler) CreateFolio(c *fiber.Ctx) error {
 	}
 	currency := strings.ToUpper(strings.TrimSpace(req.Currency))
 	if currency == "" {
-		currency = "USD"
+		// INR, not USD: rates, POS bills and every amount the UI formats are
+		// rupees, so a folio defaulting to USD labels the same money wrongly
+		// and cannot be reconciled against the rest of the system.
+		currency = "INR"
 	}
 
 	hotelID := h.hotelID(c)

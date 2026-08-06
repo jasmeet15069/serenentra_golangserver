@@ -31,6 +31,8 @@ type RoomRepository interface {
 	FindStayByID(ctx context.Context, hotelID, id uuid.UUID) (*domain.GuestStay, error)
 	ListStays(ctx context.Context, hotelID uuid.UUID, filters map[string]interface{}) ([]domain.GuestStay, error)
 	RoomHasActiveStay(ctx context.Context, hotelID, roomID uuid.UUID) (bool, error)
+	EnsureGuest(ctx context.Context, hotelID uuid.UUID, name, email, phone string) (uuid.UUID, error)
+	EnsureFolioForBooking(ctx context.Context, hotelID, bookingID, guestID uuid.UUID, currency string) (uuid.UUID, error)
 	UpdateStay(ctx context.Context, hotelID, id uuid.UUID, fields map[string]interface{}) error
 	DeleteStay(ctx context.Context, hotelID, id uuid.UUID) error
 
@@ -346,6 +348,108 @@ func (r *roomRepository) UpdateStay(ctx context.Context, hotelID, id uuid.UUID, 
 		return ErrNotFound
 	}
 	return nil
+}
+
+// EnsureGuest finds or creates the CRM guest behind a booking and returns its
+// id, mirroring what the POS path does for accounting customers.
+//
+// Reservations used to store only a free-text guest_name, leaving
+// guest_stays.guest_id null on every row. That broke the chain the front desk
+// depends on: a folio requires a guest_id, so check-in could not open one, so
+// room charges had nowhere to post and the billing screen stayed empty however
+// many guests had stayed. It also meant a returning guest was invisible to CRM.
+//
+// Matched on phone first, then email; both are the identifiers staff actually
+// re-key. With neither, there is nothing to match on and no guest is created —
+// the caller keeps a null guest_id rather than accumulating duplicates.
+func (r *roomRepository) EnsureGuest(ctx context.Context, hotelID uuid.UUID, name, email, phone string) (uuid.UUID, error) {
+	name, email, phone = strings.TrimSpace(name), strings.TrimSpace(email), strings.TrimSpace(phone)
+	if phone == "" && email == "" {
+		return uuid.Nil, nil
+	}
+	db := poolFromContext(ctx, r.db.Pool)
+
+	// digitsOnly keeps matching stable across "+91 98765 43210" and "9876543210".
+	const findByPhone = `
+		SELECT id FROM guests
+		WHERE hotel_id = $1
+		  AND regexp_replace(COALESCE(phone,''), '\D', '', 'g') = regexp_replace($2, '\D', '', 'g')
+		  AND regexp_replace($2, '\D', '', 'g') <> ''
+		LIMIT 1`
+	const findByEmail = `
+		SELECT id FROM guests
+		WHERE hotel_id = $1 AND lower(COALESCE(email,'')) = lower($2) AND $2 <> ''
+		LIMIT 1`
+
+	var id uuid.UUID
+	for _, q := range []struct {
+		sql string
+		arg string
+	}{{findByPhone, phone}, {findByEmail, email}} {
+		if q.arg == "" {
+			continue
+		}
+		err := db.QueryRow(ctx, q.sql, hotelID, q.arg).Scan(&id)
+		if err == nil {
+			// Backfill whichever contact detail the record was missing, without
+			// overwriting anything already recorded.
+			_, _ = db.Exec(ctx, `
+				UPDATE guests
+				SET email = COALESCE(NULLIF(email,''), NULLIF($2,'')),
+				    phone = COALESCE(NULLIF(phone,''), NULLIF($3,'')),
+				    updated_at = now()
+				WHERE id = $1`, id, email, phone)
+			return id, nil
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return uuid.Nil, fmt.Errorf("roomRepo.EnsureGuest lookup: %w", err)
+		}
+	}
+
+	if name == "" {
+		name = "Guest " + phone
+	}
+	id = uuid.New()
+	if err := db.QueryRow(ctx, `
+		INSERT INTO guests (id, hotel_id, full_name, email, phone, created_at, updated_at)
+		VALUES ($1, $2, $3, NULLIF($4,''), NULLIF($5,''), now(), now())
+		RETURNING id`, id, hotelID, name, email, phone).Scan(&id); err != nil {
+		return uuid.Nil, fmt.Errorf("roomRepo.EnsureGuest insert: %w", err)
+	}
+	return id, nil
+}
+
+// EnsureFolioForBooking opens the guest's folio for a booking, or returns the
+// existing one. Idempotent, so a repeated check-in cannot open a second folio
+// and split one stay's charges across two bills.
+func (r *roomRepository) EnsureFolioForBooking(ctx context.Context, hotelID, bookingID, guestID uuid.UUID, currency string) (uuid.UUID, error) {
+	if guestID == uuid.Nil {
+		return uuid.Nil, nil
+	}
+	if currency == "" {
+		currency = "INR"
+	}
+	db := poolFromContext(ctx, r.db.Pool)
+
+	var id uuid.UUID
+	err := db.QueryRow(ctx,
+		`SELECT id FROM folios WHERE hotel_id = $1 AND booking_id = $2 LIMIT 1`,
+		hotelID, bookingID).Scan(&id)
+	if err == nil {
+		return id, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return uuid.Nil, fmt.Errorf("roomRepo.EnsureFolioForBooking lookup: %w", err)
+	}
+
+	id = uuid.New()
+	if err := db.QueryRow(ctx, `
+		INSERT INTO folios (id, hotel_id, booking_id, guest_id, status, currency, created_at)
+		VALUES ($1, $2, $3, $4, 'open', $5, now())
+		RETURNING id`, id, hotelID, bookingID, guestID, currency).Scan(&id); err != nil {
+		return uuid.Nil, fmt.Errorf("roomRepo.EnsureFolioForBooking insert: %w", err)
+	}
+	return id, nil
 }
 
 // RoomHasActiveStay reports whether someone is currently in the room: a stay

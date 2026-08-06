@@ -207,6 +207,15 @@ func (h *ReservationHandler) Create(c *fiber.Ctx) error {
 		UpdatedAt:    time.Now().UTC(),
 	}
 
+	// Link the booking to a CRM guest, creating one on first visit. Without
+	// this guest_id stays null, and a null guest_id is what stops check-in
+	// opening a folio — so room charges have nowhere to post and the guest is
+	// invisible to CRM. Best-effort: a booking is still worth taking if the
+	// guest record cannot be written.
+	if guestID, gErr := h.roomRepo.EnsureGuest(c.Context(), hotelID, req.GuestName, req.GuestEmail, req.GuestPhone); gErr == nil && guestID != uuid.Nil {
+		stay.GuestID = &guestID
+	}
+
 	created, err := h.roomRepo.CreateStay(c.Context(), hotelID, stay)
 	if err != nil {
 		return response.Error(c, fiber.StatusInternalServerError, fmt.Sprintf("failed to create: %v", err))
@@ -332,6 +341,26 @@ func (h *ReservationHandler) CheckIn(c *fiber.Ctx) error {
 	stay, _ := h.roomRepo.FindStayByID(c.Context(), tenantHotelID(c), id)
 	if stay != nil {
 		_ = h.roomRepo.UpdateRoomStatus(c.Context(), tenantHotelID(c), stay.RoomID, domain.RoomStatusOccupied)
+
+		// Open the folio the stay's charges post to. Bookings taken before
+		// guest linking existed have no guest_id, so resolve one from the
+		// contact details on the stay rather than leaving those check-ins
+		// without a folio.
+		guestID := uuid.Nil
+		if stay.GuestID != nil {
+			guestID = *stay.GuestID
+		}
+		if guestID == uuid.Nil {
+			if gid, gErr := h.roomRepo.EnsureGuest(c.Context(), tenantHotelID(c),
+				stay.GuestName, derefStr(stay.GuestEmail), derefStr(stay.GuestPhone)); gErr == nil && gid != uuid.Nil {
+				guestID = gid
+				_ = h.roomRepo.UpdateStay(c.Context(), tenantHotelID(c), id,
+					map[string]interface{}{"guest_id": gid})
+			}
+		}
+		if guestID != uuid.Nil {
+			_, _ = h.roomRepo.EnsureFolioForBooking(c.Context(), tenantHotelID(c), id, guestID, "INR")
+		}
 	}
 
 	// Notify on whichever contact channels the guest actually provided — a
