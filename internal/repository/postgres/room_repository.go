@@ -369,12 +369,16 @@ func (r *roomRepository) EnsureGuest(ctx context.Context, hotelID uuid.UUID, nam
 	}
 	db := poolFromContext(ctx, r.db.Pool)
 
-	// digitsOnly keeps matching stable across "+91 98765 43210" and "9876543210".
+	// Compare the last 10 digits, not all of them: "+91 98111 22333" reduces to
+	// 919811122333 and "9811122333" to 9811122333, so a whole-string comparison
+	// treats one person as two the moment someone types the country code. Ten
+	// is the Indian subscriber-number length, which is what both forms share.
 	const findByPhone = `
 		SELECT id FROM guests
 		WHERE hotel_id = $1
-		  AND regexp_replace(COALESCE(phone,''), '\D', '', 'g') = regexp_replace($2, '\D', '', 'g')
-		  AND regexp_replace($2, '\D', '', 'g') <> ''
+		  AND length(regexp_replace($2, '\D', '', 'g')) >= 10
+		  AND right(regexp_replace(COALESCE(phone,''), '\D', '', 'g'), 10)
+		    = right(regexp_replace($2, '\D', '', 'g'), 10)
 		LIMIT 1`
 	const findByEmail = `
 		SELECT id FROM guests

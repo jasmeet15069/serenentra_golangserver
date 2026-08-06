@@ -207,14 +207,15 @@ func (h *ReservationHandler) Create(c *fiber.Ctx) error {
 		UpdatedAt:    time.Now().UTC(),
 	}
 
-	// Link the booking to a CRM guest, creating one on first visit. Without
-	// this guest_id stays null, and a null guest_id is what stops check-in
-	// opening a folio — so room charges have nowhere to post and the guest is
-	// invisible to CRM. Best-effort: a booking is still worth taking if the
-	// guest record cannot be written.
-	if guestID, gErr := h.roomRepo.EnsureGuest(c.Context(), hotelID, req.GuestName, req.GuestEmail, req.GuestPhone); gErr == nil && guestID != uuid.Nil {
-		stay.GuestID = &guestID
-	}
+	// Record the guest in CRM so a returning booker is recognised and check-in
+	// has someone to open a folio for. Best-effort: a booking is still worth
+	// taking if the CRM write fails.
+	//
+	// The id deliberately does NOT go on stay.GuestID. Despite the name,
+	// guest_stays.guest_id is a foreign key to users(id) — a guest with a login
+	// account — not to guests(id). Putting a CRM guest id there violates the
+	// constraint and fails the whole booking.
+	_, _ = h.roomRepo.EnsureGuest(c.Context(), hotelID, req.GuestName, req.GuestEmail, req.GuestPhone)
 
 	created, err := h.roomRepo.CreateStay(c.Context(), hotelID, stay)
 	if err != nil {
@@ -342,24 +343,13 @@ func (h *ReservationHandler) CheckIn(c *fiber.Ctx) error {
 	if stay != nil {
 		_ = h.roomRepo.UpdateRoomStatus(c.Context(), tenantHotelID(c), stay.RoomID, domain.RoomStatusOccupied)
 
-		// Open the folio the stay's charges post to. Bookings taken before
-		// guest linking existed have no guest_id, so resolve one from the
-		// contact details on the stay rather than leaving those check-ins
-		// without a folio.
-		guestID := uuid.Nil
-		if stay.GuestID != nil {
-			guestID = *stay.GuestID
-		}
-		if guestID == uuid.Nil {
-			if gid, gErr := h.roomRepo.EnsureGuest(c.Context(), tenantHotelID(c),
-				stay.GuestName, derefStr(stay.GuestEmail), derefStr(stay.GuestPhone)); gErr == nil && gid != uuid.Nil {
-				guestID = gid
-				_ = h.roomRepo.UpdateStay(c.Context(), tenantHotelID(c), id,
-					map[string]interface{}{"guest_id": gid})
-			}
-		}
-		if guestID != uuid.Nil {
-			_, _ = h.roomRepo.EnsureFolioForBooking(c.Context(), tenantHotelID(c), id, guestID, "INR")
+		// Open the folio this stay's charges post to. The CRM guest is resolved
+		// from the contact details on the stay, which also covers bookings made
+		// before guests were recorded at all. folios.guest_id has no foreign
+		// key, so it holds the CRM guests(id) rather than a user account.
+		if gid, gErr := h.roomRepo.EnsureGuest(c.Context(), tenantHotelID(c),
+			stay.GuestName, derefStr(stay.GuestEmail), derefStr(stay.GuestPhone)); gErr == nil && gid != uuid.Nil {
+			_, _ = h.roomRepo.EnsureFolioForBooking(c.Context(), tenantHotelID(c), id, gid, "INR")
 		}
 	}
 
