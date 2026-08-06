@@ -10,7 +10,7 @@ into the ledger, promo codes, restaurant room charges linked to the folio).
 
 | Repo | HEAD | GitHub | Production VM |
 |---|---|---|---|
-| `serenentra_golangserver` | `e03f2e1` | ✅ pushed | ✅ deployed, health 200 |
+| `serenentra_golangserver` | `c995e88` | ✅ pushed | ✅ deployed, health 200 |
 | `HmsAdminStaffPortal` | `6c42443` | ✅ pushed | ✅ deployed, `/reservations/new` 200 |
 | `superadmin_serenentra` | `f351fe7` | ✅ pushed | ✅ Vercel, login verified 200 |
 | `serenentra-landing` | unchanged | — | — |
@@ -122,6 +122,89 @@ existing overlaps that failure would abort API start-up.
   been transmitted into the request logs and every `pg_dump`.
   `payments_card_last4_check` enforces the same rule at the column, so
   `/api/tables/:table` cannot store one either.
+
+---
+
+## Night audit and channel analytics — off `bookings` (2026-08-06)
+
+`bookings` had no writers, and night audit plus channel analytics were its last
+readers. Every figure they produced was zero or empty, and `CloseDay` persisted
+those zeros as the day's official record — a full hotel filed a day with no
+revenue, no tax, no occupancy, no arrivals and no departures.
+
+Revenue and tax now come from the ledger, the same source the trial balance
+reads, so the day-close and accounting cannot disagree. Occupancy, arrivals and
+departures come from `guest_stays` — occupancy being who is in the building, not
+who arrived today, and movements being the actual check-in/check-out stamps
+rather than the dates the stay was booked for.
+
+The revenue audit now reconciles two independent sources. It read
+`revenue_daily`, which nothing populates, and assigned the one figure it got to
+all three categories, so the difference was always zero. *Expected* is the
+operation (folio charges raised, bills settled); *Actual* is the ledger. The gap
+is the point: settlement posts to the ledger after committing the sale and only
+logs on failure, so a failed posting used to leave revenue in the operation with
+nothing behind it in the books.
+
+The tax audit compared nothing and always answered "verified" — its grouping
+expression `CASE WHEN b.total > 0 THEN 'GST' ELSE 'GST' END` returns 'GST'
+either way. It now compares GST charged against GST posted to 2100, with a cent
+of tolerance so a rounding tail is not called a discrepancy.
+
+Also: `occupancy_rate` is a percentage and was being handed the raw occupied-room
+count, so eight occupied rooms filed an occupancy of 8%.
+
+`grep -rn "FROM bookings" internal/` now returns nothing.
+
+---
+
+## OTA and booking-engine ingestion (2026-08-06)
+
+`POST /api/v1/channel-manager/:connectionID/booking` accepts a pushed
+reservation; `/cancel` withdraws one. Booking.com, Agoda, OYO, MakeMyTrip and a
+client's own website previously had nowhere to push to — `channel_connections`
+recorded that a channel existed and nothing could arrive through it.
+
+**Registered in the public block of `router.go`, and it must stay there.**
+`api.Use(authGate)` gates only what is registered after it. In the staff block
+the webhook would 401 every delivery, and an OTA treats 401 as retryable, so it
+would retry forever while nothing was ever booked. It is not unauthenticated:
+the URL names a `channel_connection` and the body is HMAC-SHA256 signed with
+that connection's `api_key`, compared with `hmac.Equal`. An unknown connection
+and a bad signature return the identical 401, because distinguishing them would
+tell an unauthenticated caller which connection ids are real. A connection with
+no `api_key` authenticates nothing.
+
+Three properties matter more than the field mapping:
+
+- the raw payload is stored **before** interpretation, so a delivery is never
+  lost to a mapping bug and can be replayed;
+- a unique index on `(hotel_id, channel_name, external_ref)` is the idempotency
+  key — without it a redelivery turns one guest into four reservations holding
+  four rooms. A redelivery of something already processed answers 200 with the
+  original reservation, which is what stops the retry loop;
+- the room is chosen and taken inside the transaction that creates the stay,
+  against the same overlap constraint the front desk writes through, so an OTA
+  and the desk cannot sell the same room concurrently.
+
+A payload with no usable reference is refused: without one there is no
+idempotency key. Field aliases (`reservation_id` / `booking_id` / `ref`,
+`first_name`+`last_name` or `guest_name`, `check_in` or `check_in_date`) let a
+new provider work without a code change.
+
+Accounting: an OTA booking is money owed by the channel, so it books **Dr
+Accounts Receivable**, not Cash or Bank, against a customer resolved by the same
+resolver POS and the front desk use. Commission books separately as an expense
+and a payable — netting it would understate both revenue and the cost of
+distribution.
+
+Verified on production that the routes are live and correctly gated: an unknown
+connection returns `unauthorized channel` rather than `authentication is
+required`, which is the proof the webhook's own signature check is running and
+not the auth gate. **The full booking path has not been exercised against
+production**, deliberately — doing so writes a reservation, a customer, journal
+entries and consumes a voucher number, and the cleanup lesson below says that is
+worth doing on purpose rather than as a smoke test.
 
 ---
 
