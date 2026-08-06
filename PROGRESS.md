@@ -1,7 +1,8 @@
-# Serenentra — POS ⇄ Accounting Integration: Progress
+# Serenentra — Platform Progress
 
 Living record of what has been built, what is deployed, and what remains.
-Last updated: 2026-08-05 (backfill completed; superadmin sign-in fixed).
+Last updated: 2026-08-06 (superadmin audit; backup persistence; reservation
+wizard fixed).
 
 ---
 
@@ -9,20 +10,15 @@ Last updated: 2026-08-05 (backfill completed; superadmin sign-in fixed).
 
 | Repo | HEAD | GitHub | Production VM |
 |---|---|---|---|
-| `serenentra_golangserver` | `f2f1c62` (code) | ✅ pushed | ✅ deployed, health 200 |
-| `HmsAdminStaffPortal` | `bba3f01` | ✅ pushed | ✅ deployed, `/admin` 200 |
+| `serenentra_golangserver` | `d9f81c5` | ✅ pushed | ✅ deployed, health 200 |
+| `HmsAdminStaffPortal` | `571dc83` | ✅ pushed | ✅ deployed, `/reservations/new` 200 |
 | `superadmin_serenentra` | `f351fe7` | ✅ pushed | ✅ Vercel, login verified 200 |
 | `serenentra-landing` | unchanged | — | — |
 
 All five containers healthy: `api`, `portal`, `superadmin`, `postgres`, `redis`.
 
-`f2f1c62` is the last backend commit containing code; the commits after it on
-`serenentra_golangserver` are documentation and the audit copy of the backfill
-script, so the running binary is current with `main` despite the newer HEAD.
-
-The commits above are the last that changed deployed behaviour. Later
-documentation-only commits (including this file) ship no code and require no
-redeploy.
+Both code repos are deployed at the HEAD shown. Documentation-only commits
+after these (including this file) ship no code and need no redeploy.
 
 ---
 
@@ -184,7 +180,158 @@ Verified live: sign-in through the website returns 200. The local-dev and
 override-set paths follow from the same expression but were not separately
 exercised.
 
-### 6. Defects found and fixed along the way
+### 6. Superadmin console audited end to end
+
+Every screen was exercised against the live site: dashboard, tenants, plans,
+plan features, admin accounts, security, monitoring, front office, billing,
+night audit, reports, users, modules, POS, marketing leads, and all seven
+per-tenant panels. Every one returned 200 with real data. Nothing was broken
+on the read side.
+
+Seven **mutation** endpoints answered 200 for an id that does not exist. The
+UPDATE matched zero rows and the handler reported success anyway, so the
+console said "updated" while nothing had changed:
+
+```
+PUT   /platform/tenants/<unknown>/feature-matrix   200
+POST  /platform/tenants/<unknown>/backup/run       200
+POST  /platform/tenants/<unknown>/redis-backup/run 200
+PATCH /rooms/<unknown>/status                      200
+POST  /reservations/<unknown>/checkin              200
+POST  /reservations/<unknown>/checkout             200
+PATCH /housekeeping/tasks/<unknown>                200
+```
+
+The backup case was the serious one. `resolveBackupDSN` discards the error
+from its `tenant_registry` lookup, so an unknown tenant kept the `"shared"`
+default and the endpoint produced a **full pg_dump of the shared platform
+database**, written to a file named after a tenant that does not exist and
+recorded as that tenant's successful backup. Restoring from it would have
+restored the whole platform.
+
+Fixed at the layer that knows in each case: the room and stay repositories
+return `ErrNotFound` on a zero-row update and the handlers map that to 404;
+the housekeeping update checks `RowsAffected`; and a `requireTenant` guard
+covers both backup endpoints and both feature-matrix endpoints.
+
+`requireTenant` keys on `hotels`, not `tenant_registry`. A tenant exists in
+`hotels` from creation while its registry row is written later by
+provisioning, so keying on the registry would have 404'd a freshly created
+tenant - a worse bug than the one being fixed.
+
+Backup **routing** was deliberately left alone. `provisioned` tenants really
+do live in the shared database; their per-tenant database exists but holds
+empty scaffolding, so falling back to the shared DSN is correct for them.
+Only the unknown-tenant case was wrong.
+
+Also enforced the room status enum. `rooms.status` has no CHECK constraint
+and the handler passed the raw string through, so `PATCH` with `"clean"`
+(the status is `"cleaning"`) stored a value that every board switching on
+status would then mis-render.
+
+*(`09700b7`)*
+
+### 7. Backups were being destroyed by their own deploys
+
+`backupDir` pointed at `/app/backups` and the comment there stated it was a
+mounted volume. Neither compose file mounted anything, so artifacts lived in
+the container's writable layer. Every deploy recreates the api container,
+which silently deleted every backup taken so far while `backup_jobs` went on
+reporting them successful and downloadable. The two job rows from June have
+no file behind them and never will.
+
+Three changes were needed together:
+
+- both compose files mount a `backups` named volume at `/app/backups`
+- `deploy.sh` ships `deployments`, which it never did - Dockerfile and
+  compose edits had been *appearing* to deploy while the VM kept its old
+  files
+- backup history reports `artifact_available`, computed by stat-ing the file,
+  so the console stops offering downloads that can only fail
+
+Shipping `deployments` means the repo copy now overwrites the VM copy, and
+the two had drifted: production ran a `superadmin` service that was never
+written down in the repo. Deploying without reconciling that first would have
+removed the superadmin console's service definition. It is now in the file,
+matching the VM apart from the volume being added.
+
+Verified on the VM: took a backup, forced a container recreation, and the
+artifact was still there; history reports `available=true` for it and `false`
+for the two June rows whose files are gone.
+
+*(`3e24fec`)*
+
+### 8. New Reservation wizard could not be completed
+
+Step 2 selected rooms from `GET /rooms` by `status === "available"` - whether
+a room is free *right now*, not whether it is free for the requested dates.
+On testingxyz both rooms read `occupied` and `cleaning`, so the step offered
+nothing, Continue stays disabled until a room is chosen, and the wizard could
+not be finished for any dates however far ahead. The create call was never at
+fault; posting the wizard's exact body returned 200.
+
+Added `GET /api/rooms/available?check_in=&check_out=`, which answers the
+question the form is actually asking: rooms with no stay overlapping the
+window. Overlap comparisons are strict, so a departure on the 10th does not
+block an arrival on the 10th. Only `maintenance` excludes a room outright,
+being the one status meaning the room cannot be occupied at all. Dates are
+required rather than defaulted, so the endpoint cannot quietly answer the
+wrong question, and it is uncached because a stale hit would offer a room
+that was just taken.
+
+The wizard now calls it, names the dates in its empty state, and drops a
+chosen room that a date change has invalidated rather than submitting a room
+the server would refuse.
+
+A second bug surfaced while reproducing this: **cancelling a reservation
+released the room unconditionally**. A room routinely carries a current guest
+plus later bookings, so cancelling one of those advertised an occupied room
+as free and opened it to double-booking. The room is now released only when
+no stay is checked in and not yet checked out.
+
+Verified against the live tenant: the booked room disappears from its own
+dates, remains available for a non-overlapping window and from its checkout
+date onward, and a cancel no longer frees a room whose guest is still in it.
+
+*(`d9f81c5` backend · `571dc83` frontend)*
+
+### 9. Release pipeline: `scripts/ship.sh`
+
+The build → test → lint → deploy → smoke-test → commit → push cycle was being
+run by hand every time, which is how the portal went down for four minutes on
+2026-08-05 (a build without `NITRO_PRESET`) and how compose changes appeared to
+deploy while never leaving the laptop. It is now one command:
+
+```bash
+bash scripts/ship.sh -m "commit message"    # backend + frontend
+bash scripts/ship.sh -m "msg" --backend     # one side only
+bash scripts/ship.sh --check                # verify only: no deploy, no push
+DRY_RUN=1 bash scripts/ship.sh -m "msg"     # everything except deploy/push
+```
+
+Each step gates the next, so nothing reaches production that has not passed
+the step before it and **nothing is committed or pushed unless the deployed
+result answered 200**. Failures print the last 20 lines of output and set a
+non-zero exit.
+
+Two guards encode incidents rather than good intentions:
+
+- the frontend build is forced to `NITRO_PRESET=node-server` and then checked
+  for `.output/server/index.mjs`; without it the ship is refused, because the
+  auto-detected Cloudflare preset emits no server entry and the container
+  crash-loops into a 502
+- the push retries three times with backoff, since the GitHub DNS lookup from
+  this machine fails intermittently
+
+`scripts/deploy_portal.sh` was extracted at the same time — the portal ship
+(package `.output` + Dockerfile, back up the remote copy, extract, rebuild,
+wait for healthy) had only ever existed as a sequence typed by hand.
+
+The API's `/health` is bound to the VM's loopback and is not exposed through
+nginx, so the smoke test checks it from inside the VM the way `deploy.sh`
+does, rather than asserting on the 401 that the public `/api/health` returns.
+
+### 10. Defects found and fixed along the way
 
 - **Silently swallowed ledger errors.** The posting call was `journalID, _ =`,
   so a failure left a completed sale with no journal entry and no trace. Now
@@ -285,6 +432,19 @@ derivable from the existing chart of accounts (types are already
 Nothing prevents posting into a closed day. Night audit runs but does not seal
 the ledger.
 
+### Backups are manual, unscheduled, and unverified
+`backup_configurations` stores a cron expression per tenant, but nothing reads
+it — every backup so far was triggered by hand from the console. There is also
+no restore path and no integrity check, so an artifact's usefulness is
+untested. The two June job rows have no file behind them (see section 7) and
+should be treated as absent rather than as history.
+
+Separately, `provisioned` tenants have a per-tenant database that exists but
+holds empty scaffolding; their live data is in the shared `hotel_harmony`.
+`testing123_hotelops` is an orphan of a deleted tenant. Neither is harmful,
+but both will mislead anyone reading `tenant_registry` as a map of where data
+lives.
+
 ### No customer linkage on the legacy POS path
 `pos_orders` carries a free-text `customer_name` and no phone, so there is no
 key to match an accounting customer on. Contact capture lives on the dine-in
@@ -340,6 +500,24 @@ path, which has the fields. Closing this means adding customer columns to
   Vercel that is a private address the edge refuses, so every API call 404'd
   while the build and the pages looked fine. Defaults for production builds
   should point at production. Treat env vars as overrides, not requirements.
+- **A zero-row UPDATE is not a success.** Seven endpoints returned 200 for
+  ids that do not exist because `Exec`'s command tag was discarded. Check
+  `RowsAffected()` (or have the repository return `ErrNotFound`) wherever the
+  caller will report the outcome to a user.
+- **A default that hides a missing lookup is worse than an error.** The
+  backup DSN resolver discarded its lookup error and fell back to "shared",
+  which turned an unknown tenant into a full platform dump. Prefer failing to
+  defaulting when the input was supposed to identify something.
+- **Check what the deploy actually ships.** `deploy.sh` tarred only source
+  directories, so compose and Dockerfile edits appeared to deploy while the
+  VM kept its old files. Before trusting an infra change, confirm it on the
+  VM rather than trusting a clean deploy log.
+- **Reconcile drift before letting the repo overwrite the VM.** Production
+  ran a `superadmin` service the repo did not define; shipping `deployments`
+  without adding it first would have deleted that service.
+- **Ask the question the screen is asking.** Booking forms need availability
+  for a date range, not current room status - filtering by status hid every
+  bookable room at a full hotel and made the wizard impossible to finish.
 - **Rehearse financial writes with `ROLLBACK`.** Running the exact script with
   `COMMIT` swapped for `ROLLBACK` shows every posting and exercises the balance
   guard without persisting anything.
