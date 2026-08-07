@@ -650,19 +650,13 @@ func (h *ReservationHandler) Update(c *fiber.Ctx) error {
 		// Editing the stay dates afterwards would make the reservation disagree
 		// with those immutable accounting records; require an explicit adjustment
 		// instead of silently changing the booked amount.
-		if h.db != nil {
-			var paid bool
-			if pErr := h.db.Querier(c.Context()).QueryRow(c.Context(), `
-				SELECT EXISTS(
-					SELECT 1 FROM payments
-					WHERE hotel_id = $1 AND guest_stay_id = $2 AND status = 'completed'
-				)`, hotelID, id).Scan(&paid); pErr != nil {
-				return response.Error(c, fiber.StatusInternalServerError, "failed to verify reservation settlement")
-			}
-			if paid {
-				return response.Error(c, fiber.StatusConflict,
-					"cannot change stay dates after payment; issue an adjustment instead")
-			}
+		paid, pErr := h.hasCompletedPayment(c.Context(), hotelID, id)
+		if pErr != nil {
+			return response.Error(c, fiber.StatusInternalServerError, "failed to verify reservation settlement")
+		}
+		if paid {
+			return response.Error(c, fiber.StatusConflict,
+				"cannot change stay dates after payment; issue an adjustment instead")
 		}
 
 		effectiveCheckIn := current.CheckInDate
@@ -751,6 +745,19 @@ func (h *ReservationHandler) Update(c *fiber.Ctx) error {
 	return response.OK(c, stay)
 }
 
+func (h *ReservationHandler) hasCompletedPayment(ctx context.Context, hotelID, stayID uuid.UUID) (bool, error) {
+	if h.db == nil {
+		return false, nil
+	}
+	var paid bool
+	err := h.db.Querier(ctx).QueryRow(ctx, `
+		SELECT EXISTS(
+			SELECT 1 FROM payments
+			WHERE hotel_id = $1 AND guest_stay_id = $2 AND status = 'completed'
+		)`, hotelID, stayID).Scan(&paid)
+	return paid, err
+}
+
 func (h *ReservationHandler) Cancel(c *fiber.Ctx) error {
 	if !h.requireFrontDeskManager(c) {
 		return nil
@@ -770,6 +777,17 @@ func (h *ReservationHandler) Cancel(c *fiber.Ctx) error {
 	}
 	if stay.Status == domain.ReservationCancelled {
 		return response.Error(c, fiber.StatusConflict, "reservation is already cancelled")
+	}
+	// A completed payment already has an invoice and balanced journal entry.
+	// Cancellation must be paired with the accounting refund/credit-note flow;
+	// silently cancelling the stay here would leave that money posted as revenue.
+	paid, pErr := h.hasCompletedPayment(c.Context(), hotelID, id)
+	if pErr != nil {
+		return response.Error(c, fiber.StatusInternalServerError, "failed to verify reservation settlement")
+	}
+	if paid {
+		return response.Error(c, fiber.StatusConflict,
+			"cannot cancel a paid reservation; issue a refund or credit note first")
 	}
 
 	// Reason and fee are optional so the existing bare DELETE call keeps
