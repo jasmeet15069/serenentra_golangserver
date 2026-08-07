@@ -69,7 +69,7 @@ func (h *BookingHandler) CheckAvailability(c *fiber.Ctx) error {
 	rows, err := tenantPool(c, h.pool).Query(c.Context(), `
 		SELECT d.date::text,
 		       (SELECT COUNT(*) FROM rooms r
-		         WHERE r.hotel_id = $1 AND r.status <> 'maintenance')
+		         WHERE r.hotel_id = $1 AND r.status NOT IN (` + domain.NonSellableRoomStatusSQL + `))
 		       - COUNT(gs.id) AS available,
 		       (SELECT COUNT(*) FROM rooms r WHERE r.hotel_id = $1) AS total
 		FROM generate_series($2::date, $3::date - 1, '1 day') d(date)
@@ -133,14 +133,14 @@ func (h *BookingHandler) SearchRooms(c *fiber.Ctx) error {
 	// writes guest_stays and nothing writes bookings, so excluding on bookings
 	// meant the booking engine offered rooms that were already sold.
 	//
-	// Room status is checked as "not maintenance" rather than "is available",
-	// matching ListRoomsAvailableBetween: status describes the room right now
-	// and says nothing about the requested dates, so filtering on 'available'
-	// hides every room of a full hotel even for dates months away.
+	// Rooms are excluded by "cannot be occupied at all" rather than "is
+	// available right now", matching ListRoomsAvailableBetween: status describes
+	// the room today and says nothing about the requested dates, so filtering on
+	// 'available' hides every room of a full hotel even for dates months away.
 	q := `SELECT r.id, r.room_number, r.room_type, r.floor, r.capacity, r.price_per_night
 	      FROM rooms r
 	      WHERE r.hotel_id = $1
-	        AND r.status <> 'maintenance'
+	        AND r.status NOT IN (` + domain.NonSellableRoomStatusSQL + `)
 	        AND NOT EXISTS (
 	            SELECT 1 FROM guest_stays gs
 	            WHERE gs.hotel_id = r.hotel_id

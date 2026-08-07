@@ -17,7 +17,23 @@ const (
 	RoomStatusOccupied    RoomStatus = "occupied"
 	RoomStatusCleaning    RoomStatus = "cleaning"
 	RoomStatusMaintenance RoomStatus = "maintenance"
+	// RoomStatusOutOfOrder is a room withdrawn from sale — flood damage, a
+	// failed air-conditioner, a refurbishment. Distinct from maintenance, which
+	// means someone is working on it and it is expected back shortly. Both are
+	// unsellable, but only out-of-order should be explained to a revenue manager
+	// as lost inventory rather than routine servicing.
+	RoomStatusOutOfOrder RoomStatus = "out_of_order"
 )
+
+// NonSellableRoomStatusSQL is the value list for a `status NOT IN (…)` clause,
+// defined once because four separate queries decide what can be sold: the
+// date-range availability query, the booking-engine search, its per-day
+// denominator, and the night-audit occupancy rate. A status added to the enum
+// but missed in one of those would quietly offer a room that cannot be occupied.
+//
+// A literal rather than a parameter: it is interpolated into query text, so it
+// must never carry anything but these constants.
+const NonSellableRoomStatusSQL = `'maintenance','out_of_order'`
 
 // Valid reports whether s is one of the four known room statuses. The column
 // has no CHECK constraint, so without this an arbitrary string reaches the
@@ -25,7 +41,8 @@ const (
 // then on.
 func (s RoomStatus) Valid() bool {
 	switch s {
-	case RoomStatusAvailable, RoomStatusOccupied, RoomStatusCleaning, RoomStatusMaintenance:
+	case RoomStatusAvailable, RoomStatusOccupied, RoomStatusCleaning,
+		RoomStatusMaintenance, RoomStatusOutOfOrder:
 		return true
 	}
 	return false
@@ -36,7 +53,16 @@ func RoomStatusValues() []string {
 	return []string{
 		string(RoomStatusAvailable), string(RoomStatusOccupied),
 		string(RoomStatusCleaning), string(RoomStatusMaintenance),
+		string(RoomStatusOutOfOrder),
 	}
+}
+
+// Sellable reports whether a room can be occupied at all. Being occupied or
+// mid-clean does not make a room unsellable — those describe it right now and
+// say nothing about a stay next month, which is why availability is decided by
+// overlapping stays rather than by status.
+func (s RoomStatus) Sellable() bool {
+	return s != RoomStatusMaintenance && s != RoomStatusOutOfOrder
 }
 
 type OrderStatus string

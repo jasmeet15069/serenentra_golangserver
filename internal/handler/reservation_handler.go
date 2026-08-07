@@ -92,7 +92,161 @@ func (h *ReservationHandler) Register(r fiber.Router) {
 	r.Delete("/reservations/:id", h.Cancel)
 	r.Post("/reservations/:id/checkin", h.CheckIn)
 	r.Post("/reservations/:id/checkout", h.CheckOut)
+	r.Post("/reservations/:id/move-room", h.MoveRoom)
 	h.registerDocumentRoutes(r)
+}
+
+type moveRoomRequest struct {
+	RoomID string `json:"room_id"`
+	Reason string `json:"reason"`
+}
+
+// MoveRoom transfers a stay to a different room.
+//
+// The front desk does this constantly — a guest complains about noise, a room
+// fails after arrival, an upgrade is offered — and there was no way to do it.
+// The only route was editing the reservation, which cannot change the room at
+// all, so the desk's workaround was cancelling and rebooking: that loses the
+// confirmation number, the folio and anything already charged to it.
+//
+// The move is refused unless the destination is genuinely free for the stay's
+// dates, and the guest_stays_no_overlap constraint has the final say — the
+// availability read and the update are two statements, so a concurrent booking
+// can still take the room in between.
+func (h *ReservationHandler) MoveRoom(c *fiber.Ctx) error {
+	if !h.requireFrontDesk(c) {
+		return nil
+	}
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return response.Error(c, fiber.StatusBadRequest, "invalid id")
+	}
+	var req moveRoomRequest
+	if err := c.BodyParser(&req); err != nil {
+		return response.Error(c, fiber.StatusBadRequest, "invalid request body")
+	}
+	newRoomID, err := uuid.Parse(strings.TrimSpace(req.RoomID))
+	if err != nil {
+		return response.Error(c, fiber.StatusBadRequest, "room_id is required")
+	}
+
+	hotelID := tenantHotelID(c)
+	stay, err := h.roomRepo.FindStayByID(c.Context(), hotelID, id)
+	if err != nil {
+		return response.Error(c, fiber.StatusNotFound, "reservation not found")
+	}
+	if stay.Status == domain.ReservationCancelled {
+		return response.Error(c, fiber.StatusConflict, "cannot move a cancelled reservation")
+	}
+	if stay.ActualCheckOut != nil {
+		return response.Error(c, fiber.StatusConflict, "the stay has already ended")
+	}
+	if stay.RoomID == newRoomID {
+		return response.Error(c, fiber.StatusBadRequest, "the reservation is already in that room")
+	}
+
+	newRoom, err := h.roomRepo.FindRoomByID(c.Context(), hotelID, newRoomID)
+	if err != nil {
+		return response.Error(c, fiber.StatusNotFound, "room not found")
+	}
+	if !newRoom.Status.Sellable() {
+		return response.Error(c, fiber.StatusConflict, fmt.Sprintf(
+			"room %s is %s and cannot take a guest", newRoom.RoomNumber, newRoom.Status))
+	}
+	if newRoom.Capacity > 0 && stay.Adults+stay.Children > newRoom.Capacity {
+		return response.Error(c, fiber.StatusBadRequest, fmt.Sprintf(
+			"room %s sleeps %d; this booking is for %d guests",
+			newRoom.RoomNumber, newRoom.Capacity, stay.Adults+stay.Children))
+	}
+
+	// Free for the whole stay, ignoring this reservation, which would otherwise
+	// collide with itself.
+	free, err := h.roomRepo.RoomIsFree(c.Context(), hotelID, newRoomID, stay.CheckInDate, stay.CheckOutDate, id)
+	if err != nil {
+		return response.Error(c, fiber.StatusInternalServerError, "failed to check room availability")
+	}
+	if !free {
+		return response.Error(c, fiber.StatusConflict, fmt.Sprintf(
+			"room %s is not free for %s to %s", newRoom.RoomNumber,
+			stay.CheckInDate.Format("2006-01-02"), stay.CheckOutDate.Format("2006-01-02")))
+	}
+
+	// Repricing follows the same rule as editing the dates: once the stay is
+	// paid it has an invoice and a balanced journal entry behind it, and
+	// silently changing the amount would leave the reservation disagreeing with
+	// the books. A paid stay still moves — the guest has to sleep somewhere —
+	// but at the price already invoiced, and any difference is settled through
+	// the existing adjustment flow.
+	paid, err := h.hasCompletedPayment(c.Context(), hotelID, id)
+	if err != nil {
+		return response.Error(c, fiber.StatusInternalServerError, "failed to verify reservation settlement")
+	}
+
+	fields := map[string]interface{}{"room_id": newRoomID}
+	repriced := false
+	if !paid {
+		taxRate, tErr := h.roomRepo.HotelGSTRate(c.Context(), hotelID)
+		if tErr != nil {
+			taxRate = 0
+		}
+		quote := priceStay(newRoom.PricePerNight, stay.CheckInDate, stay.CheckOutDate, taxRate, stay.DiscountAmount)
+		fields["total_amount"] = quote.BaseTotal
+		fields["tax_amount"] = quote.TaxAmount
+		repriced = true
+	}
+
+	inHouse := stay.ActualCheckIn != nil
+	oldRoomID := stay.RoomID
+
+	err = h.inTx(c.Context(), func(ctx context.Context) error {
+		if uErr := h.roomRepo.UpdateStay(ctx, hotelID, id, fields); uErr != nil {
+			return uErr
+		}
+		if !inHouse {
+			// Nobody has moved yet, so neither room's status changes.
+			return nil
+		}
+		if rErr := h.roomRepo.UpdateRoomStatus(ctx, hotelID, newRoomID, domain.RoomStatusOccupied); rErr != nil {
+			return rErr
+		}
+		// The vacated room needs cleaning before it can be sold again, and
+		// housekeeping only learns about it from a task — the same handover
+		// check-out performs.
+		if _, hErr := h.db.Querier(ctx).Exec(ctx, `
+			INSERT INTO housekeeping_assignments
+			       (id, hotel_id, room_id, task_type, priority, status, notes, created_at)
+			SELECT $1, $2, $3, 'checkout_clean', 'normal', 'pending', $4, now()
+			 WHERE NOT EXISTS (
+			     SELECT 1 FROM housekeeping_assignments
+			      WHERE hotel_id = $2 AND room_id = $3
+			        AND task_type = 'checkout_clean' AND status IN ('pending','in_progress')
+			 )`,
+			uuid.New(), hotelID, oldRoomID,
+			"Room move — "+stay.GuestName); hErr != nil {
+			return hErr
+		}
+		return h.roomRepo.UpdateRoomStatus(ctx, hotelID, oldRoomID, domain.RoomStatusCleaning)
+	})
+	if err != nil {
+		if isOverlapViolation(err) {
+			return response.Error(c, fiber.StatusConflict, fmt.Sprintf(
+				"room %s was taken for those dates while the move was being made", newRoom.RoomNumber))
+		}
+		if errors.Is(err, postgres.ErrNotFound) {
+			return response.Error(c, fiber.StatusNotFound, "reservation not found")
+		}
+		return response.Error(c, fiber.StatusInternalServerError, "room move failed")
+	}
+
+	moved, _ := h.roomRepo.FindStayByID(c.Context(), hotelID, id)
+	return response.OK(c, fiber.Map{
+		"status":      "moved",
+		"room_id":     newRoomID,
+		"room_number": newRoom.RoomNumber,
+		"repriced":    repriced,
+		"reason":      strings.TrimSpace(req.Reason),
+		"reservation": moved,
+	})
 }
 
 func (h *ReservationHandler) List(c *fiber.Ctx) error {

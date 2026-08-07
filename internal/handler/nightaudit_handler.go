@@ -1,4 +1,4 @@
-﻿package handler
+package handler
 
 import (
 	"fmt"
@@ -8,6 +8,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/hotelharmony/api/internal/domain"
 	"github.com/hotelharmony/api/pkg/response"
 )
 
@@ -330,7 +331,8 @@ func (h *NightAuditHandler) CloseDay(c *fiber.Ctx) error {
 	// occupancy_rate is a percentage. It was being handed the raw occupied-room
 	// count, so a hotel with 8 rooms occupied filed an occupancy of 8%.
 	if err := tenantPool(c, h.pool).QueryRow(c.Context(),
-		`SELECT COUNT(*) FROM rooms WHERE hotel_id = $1 AND status <> 'maintenance'`,
+		`SELECT COUNT(*) FROM rooms WHERE hotel_id = $1
+		   AND status NOT IN (`+domain.NonSellableRoomStatusSQL+`)`,
 		hotelID,
 	).Scan(&sellableRooms); err != nil {
 		return response.Error(c, fiber.StatusInternalServerError, err.Error())

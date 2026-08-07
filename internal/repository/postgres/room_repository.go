@@ -122,7 +122,7 @@ func (r *roomRepository) ListRoomsAvailableBetween(ctx context.Context, hotelID 
 		       status, amenities, created_at, updated_at
 		FROM rooms rm
 		WHERE rm.hotel_id = $1
-		  AND rm.status <> 'maintenance'
+		  AND rm.status NOT IN (` + domain.NonSellableRoomStatusSQL + `)
 		  AND NOT EXISTS (
 		      SELECT 1 FROM guest_stays gs
 		      WHERE gs.hotel_id = rm.hotel_id
