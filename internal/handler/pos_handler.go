@@ -68,6 +68,7 @@ func (h *POSHandler) Register(r fiber.Router) {
 	g.Patch("/pos/outlets/:id", h.UpdateOutlet)
 
 	// Dine-In workflow: tables -> sessions -> KOTs -> bill -> payments.
+	g.Get("/pos/analytics", h.Analytics)
 	g.Get("/pos/tables", h.ListTables)
 	g.Post("/pos/tables", h.CreateTable)
 	g.Patch("/pos/tables/:id", h.UpdateTable)
