@@ -948,7 +948,18 @@ func (h *POSHandler) UpdateBill(c *fiber.Ctx) error {
 	if req.DiscountValue != nil {
 		b.DiscountValue = *req.DiscountValue
 	}
-	if req.TaxRate != nil {
+	if req.TaxRate != nil && *req.TaxRate != b.TaxRate {
+		// The bill's tax rate is seeded from outlets.default_tax_rate, which is
+		// the rate the property has configured. Overriding it per bill is
+		// occasionally legitimate — a mixed-rate outlet, an exempt sale — but it
+		// is also the single easiest way to under-report GST, so it carries
+		// manager oversight while discounts and tips stay at cashier level.
+		if !h.requireRoles(c, "admin", "hotel_admin", "super_admin", "food_manager", "platform_admin") {
+			return nil
+		}
+		if *req.TaxRate < 0 || *req.TaxRate > 100 {
+			return response.Error(c, fiber.StatusUnprocessableEntity, "tax_rate must be between 0 and 100")
+		}
 		b.TaxRate = *req.TaxRate
 	}
 	if req.TipType != nil {

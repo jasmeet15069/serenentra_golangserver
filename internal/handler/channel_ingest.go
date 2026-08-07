@@ -19,6 +19,7 @@ import (
 
 	"github.com/hotelharmony/api/internal/domain"
 	"github.com/hotelharmony/api/internal/repository/postgres"
+	"github.com/hotelharmony/api/internal/worker"
 	"github.com/hotelharmony/api/pkg/response"
 )
 
@@ -64,6 +65,7 @@ func NewChannelIngestHandler(pool *pgxpool.Pool, db *postgres.DB, roomRepo postg
 func (h *ChannelIngestHandler) Register(r fiber.Router) {
 	r.Post("/v1/channel-manager/:connectionID/booking", h.Ingest)
 	r.Post("/v1/channel-manager/:connectionID/cancel", h.Cancel)
+	r.Get("/v1/channel-manager/:connectionID/booking/:ref", h.DeliveryStatus)
 }
 
 // channelBookingPayload is the normalised shape every adapter maps onto.
@@ -241,39 +243,112 @@ func (h *ChannelIngestHandler) Ingest(c *fiber.Ctx) error {
 		})
 	}
 
-	stayID, commission, procErr := h.process(ctx, cc, payload, externalRef)
-	if procErr != nil {
-		_, _ = h.pool.Exec(ctx, `
+	// Processed off the request path, which is what the brief asks for and what
+	// an OTA expects: it wants the delivery acknowledged, not the hotel's room
+	// assignment and double-entry posting done while it holds the connection.
+	//
+	// Safe to answer before the work is done because the payload is already
+	// stored: a failure leaves a row marked 'failed' with its error, replayable
+	// once the cause is fixed, rather than a lost booking.
+	//
+	// The tenant pool is resolved HERE, on the request, and pinned onto the
+	// background context. The middleware's value lives on the Fiber request
+	// context and is gone by the time the job runs, so without this a tenant
+	// with a dedicated database would have its booking written to the shared one.
+	bgBase := postgres.WithTenantPool(context.Background(),
+		postgres.PoolForContext(ctx, h.pool))
+
+	worker.SubmitOrRun("channel.ingest", func(jobCtx context.Context) error {
+		// The job's own deadline applies; the tenant pin rides along.
+		runCtx := postgres.WithTenantPool(jobCtx, postgres.PoolForContext(bgBase, h.pool))
+
+		stayID, commission, procErr := h.process(runCtx, cc, payload, externalRef)
+		if procErr != nil {
+			_, _ = h.pool.Exec(runCtx, `
+				UPDATE channel_bookings
+				   SET status = 'failed', error = $2, processed_at = now()
+				 WHERE id = $1`, recordID, procErr.Error())
+			log.Printf("channel: ingest FAILED for %s ref %s: %v — payload stored as %s for replay",
+				cc.Name, externalRef, procErr, recordID)
+			return procErr
+		}
+
+		if _, err := h.pool.Exec(runCtx, `
 			UPDATE channel_bookings
-			   SET status = 'failed', error = $2, processed_at = now()
-			 WHERE id = $1`, recordID, procErr.Error())
-		log.Printf("channel: ingest FAILED for %s ref %s: %v — payload stored as %s for replay",
-			cc.Name, externalRef, procErr, recordID)
-		// 422, not 500: the delivery was accepted and stored, and redelivering
-		// the same payload will fail the same way. A 5xx would make the OTA
-		// retry a request that cannot succeed.
-		return response.Error(c, fiber.StatusUnprocessableEntity, procErr.Error())
+			   SET status = 'processed', guest_stay_id = $2, commission = $3,
+			       error = NULL, processed_at = now()
+			 WHERE id = $1`, recordID, stayID, commission); err != nil {
+			log.Printf("channel: booking %s created but delivery %s not marked processed: %v",
+				stayID, recordID, err)
+		}
+
+		// Records that the channel is live, which is what the connections screen
+		// shows. Nothing used to update this except a manual re-sync.
+		_, _ = h.pool.Exec(runCtx,
+			`UPDATE channel_connections SET last_sync_at = now() WHERE id = $1`, cc.ID)
+		return nil
+	})
+
+	// 202: accepted and durably stored, not yet processed. The caller polls
+	// GET /v1/channel-manager/:connectionID/booking/:ref for the outcome, and a
+	// redelivery of the same payload returns the reservation once it exists.
+	return c.Status(fiber.StatusAccepted).JSON(fiber.Map{
+		"data": fiber.Map{
+			"status":       "accepted",
+			"external_ref": externalRef,
+			"delivery_id":  recordID,
+		},
+	})
+}
+
+// DeliveryStatus reports what became of a delivery.
+//
+// Processing is asynchronous, so the 202 above cannot carry the reservation id.
+// This is how a channel finds out — and how an operator investigates one that
+// failed, since the stored error and the original payload are both here.
+func (h *ChannelIngestHandler) DeliveryStatus(c *fiber.Ctx) error {
+	connID, err := uuid.Parse(c.Params("connectionID"))
+	if err != nil {
+		return response.Error(c, fiber.StatusBadRequest, "invalid channel connection id")
+	}
+	cc, err := h.lookupConnection(c.Context(), connID)
+	if err != nil {
+		return response.Error(c, fiber.StatusUnauthorized, "unauthorized channel")
+	}
+	// Signed over the raw body like the other two, so a GET signs an empty
+	// string. Without this the endpoint would leak booking references and guest
+	// names to anyone holding a connection id.
+	if !verifySignature(c.Body(), cc.APIKey, c.Get("X-Signature")) {
+		return response.Error(c, fiber.StatusUnauthorized, "unauthorized channel")
 	}
 
-	if _, err := h.pool.Exec(ctx, `
-		UPDATE channel_bookings
-		   SET status = 'processed', guest_stay_id = $2, commission = $3,
-		       error = NULL, processed_at = now()
-		 WHERE id = $1`, recordID, stayID, commission); err != nil {
-		log.Printf("channel: booking %s created but delivery %s not marked processed: %v",
-			stayID, recordID, err)
+	ref := strings.TrimSpace(c.Params("ref"))
+	if ref == "" {
+		return response.Error(c, fiber.StatusBadRequest, "external reference is required")
 	}
 
-	// Record that the channel is live, which is what the connections screen
-	// shows. Nothing used to update this except a manual re-sync.
-	_, _ = h.pool.Exec(ctx,
-		`UPDATE channel_connections SET last_sync_at = now() WHERE id = $1`, cc.ID)
+	var status string
+	var stayID *uuid.UUID
+	var errText *string
+	var commission float64
+	qErr := h.pool.QueryRow(c.Context(), `
+		SELECT status, guest_stay_id, error, commission
+		  FROM channel_bookings
+		 WHERE hotel_id = $1 AND channel_name = $2 AND external_ref = $3`,
+		cc.HotelID, cc.Name, ref).Scan(&status, &stayID, &errText, &commission)
+	if qErr != nil {
+		if errors.Is(qErr, pgx.ErrNoRows) {
+			return response.Error(c, fiber.StatusNotFound, "no delivery with that reference")
+		}
+		return response.Error(c, fiber.StatusInternalServerError, "lookup failed")
+	}
 
-	return response.Created(c, fiber.Map{
-		"status":         "processed",
-		"external_ref":   externalRef,
+	return response.OK(c, fiber.Map{
+		"external_ref":   ref,
+		"status":         status,
 		"reservation_id": stayID,
 		"commission":     commission,
+		"error":          errText,
 	})
 }
 

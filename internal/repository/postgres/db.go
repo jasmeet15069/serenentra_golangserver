@@ -40,6 +40,27 @@ type Querier interface {
 // uses for Locals.
 type txContextKey struct{}
 
+// poolContextKey carries a tenant pool on a context that is no longer a
+// request. See WithTenantPool.
+type poolContextKey struct{}
+
+// WithTenantPool pins a tenant's pool onto a context.
+//
+// Background work outlives the request it came from, and the "tenant_pool"
+// value the middleware sets lives on the Fiber request context — so a job
+// handed to the worker pool loses it and silently falls back to the shared
+// database. For a tenant with a dedicated database that means the work lands in
+// the wrong one.
+//
+// Resolve the pool while still on the request, pin it here, and the repository
+// methods keep reaching the right database once the request is gone.
+func WithTenantPool(ctx context.Context, p *pgxpool.Pool) context.Context {
+	if p == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, poolContextKey{}, p)
+}
+
 // poolFromContext returns the executor a repository should use, in precedence
 // order:
 //
@@ -63,6 +84,10 @@ func poolFromContext(ctx context.Context, fallback *pgxpool.Pool) Querier {
 	if p, ok := ctx.Value("tenant_pool").(*pgxpool.Pool); ok && p != nil {
 		return p
 	}
+	// Pinned by WithTenantPool for work that has outlived its request.
+	if p, ok := ctx.Value(poolContextKey{}).(*pgxpool.Pool); ok && p != nil {
+		return p
+	}
 	return fallback
 }
 
@@ -71,6 +96,9 @@ func poolFromContext(ctx context.Context, fallback *pgxpool.Pool) Querier {
 // transaction: a handler that wants one should use WithTenantTx.
 func PoolForContext(ctx context.Context, fallback *pgxpool.Pool) *pgxpool.Pool {
 	if p, ok := ctx.Value("tenant_pool").(*pgxpool.Pool); ok && p != nil {
+		return p
+	}
+	if p, ok := ctx.Value(poolContextKey{}).(*pgxpool.Pool); ok && p != nil {
 		return p
 	}
 	return fallback
