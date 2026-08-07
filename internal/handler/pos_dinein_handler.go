@@ -899,6 +899,18 @@ func (h *POSHandler) GenerateBill(c *fiber.Ctx) error {
 
 // UpdateBill sets discount / tip / tax_rate on an open bill and recomputes totals.
 func (h *POSHandler) UpdateBill(c *fiber.Ctx) error {
+	// Everything this endpoint accepts changes what the guest pays and what the
+	// hotel owes in tax: discount, tax rate, tip, rounding. Settling and
+	// refunding a bill were both role-guarded and this was not, so any
+	// authenticated account — a waiter, housekeeping, anyone with a login —
+	// could take a bill to zero with a 100% discount, or set tax_rate to 0 and
+	// under-report GST on a real sale.
+	//
+	// Same set as AddBillPayment: whoever may take the money may adjust the
+	// bill, and nobody below that.
+	if !h.requireRoles(c, "admin", "hotel_admin", "super_admin", "receptionist", "cashier", "food_manager", "platform_admin") {
+		return nil
+	}
 	id, err := uuid.Parse(c.Params("id"))
 	if err != nil {
 		return response.Error(c, fiber.StatusBadRequest, "invalid bill id")
@@ -970,6 +982,12 @@ func (h *POSHandler) UpdateBill(c *fiber.Ctx) error {
 
 // FinalizeBill locks the bill so items and adjustments can no longer change.
 func (h *POSHandler) FinalizeBill(c *fiber.Ctx) error {
+	// Finalising is the point past which the bill cannot be corrected, and it is
+	// the gate payment sits behind. Guarded like the rest of the money path
+	// rather than being the one step anyone could trigger.
+	if !h.requireRoles(c, "admin", "hotel_admin", "super_admin", "receptionist", "cashier", "food_manager", "platform_admin") {
+		return nil
+	}
 	id, err := uuid.Parse(c.Params("id"))
 	if err != nil {
 		return response.Error(c, fiber.StatusBadRequest, "invalid bill id")
