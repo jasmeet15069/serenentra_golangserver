@@ -1,7 +1,9 @@
-﻿package handler
+package handler
 
 import (
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -23,6 +25,8 @@ func (h *HousekeepingHandler) Register(r fiber.Router) {
 	r.Get("/housekeeping/tasks", h.ListTasks)
 	r.Post("/housekeeping/tasks", h.CreateTask)
 	r.Patch("/housekeeping/tasks/:id", h.UpdateTask)
+	r.Post("/housekeeping/tasks/:id/inspect", h.InspectTask)
+	r.Get("/housekeeping/due", h.ListDue)
 	r.Get("/housekeeping/lost-items", h.ListLostItems)
 	r.Post("/housekeeping/lost-items", h.CreateLostItem)
 	r.Patch("/housekeeping/lost-items/:id", h.UpdateLostItem)
@@ -540,4 +544,145 @@ func safeInt(i *int) int {
 		return 0
 	}
 	return *i
+}
+
+// ---------------------------------------------------------------------------
+// Supervisor sign-off and the due board
+// ---------------------------------------------------------------------------
+
+// InspectTask records a supervisor's sign-off on completed work.
+//
+// housekeeping_assignments has carried inspected_by since migration 002 with
+// nothing ever writing it and no timestamp beside it, so "this room was checked"
+// was a column the schema implied and the system could not answer. A floor
+// supervisor had no queue of what was waiting on them and no way to record that
+// they had passed a room.
+//
+// Only completed work can be signed off: inspecting a room nobody has cleaned
+// yet is the failure this is meant to prevent, not a shortcut worth allowing.
+func (h *HousekeepingHandler) InspectTask(c *fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return response.Error(c, fiber.StatusBadRequest, "invalid task id")
+	}
+	var req struct {
+		Passed bool   `json:"passed"`
+		Notes  string `json:"notes"`
+	}
+	// A bare POST means "passed", which is the common case at the door of a
+	// clean room. Failing one is the deliberate act and carries a body.
+	if len(c.Body()) > 0 {
+		if err := c.BodyParser(&req); err != nil {
+			return response.Error(c, fiber.StatusBadRequest, "invalid request body")
+		}
+	} else {
+		req.Passed = true
+	}
+
+	hotelID := tenantHotelID(c)
+	inspector := actorUserID(c)
+
+	// A failed inspection sends the room back to the floor rather than closing
+	// it: the work is not done, so the task returns to pending and the room
+	// stays out of the sellable pool until someone redoes it.
+	newStatus := "inspected"
+	if !req.Passed {
+		newStatus = "pending"
+	}
+
+	var roomID uuid.UUID
+	var status string
+	err = tenantPool(c, h.pool).QueryRow(c.Context(), `
+		UPDATE housekeeping_assignments
+		   SET status = $1,
+		       inspected_by = $2,
+		       inspected_at = now(),
+		       notes = COALESCE(NULLIF($3, ''), notes),
+		       updated_at = now()
+		 WHERE id = $4 AND hotel_id = $5 AND status = 'completed'
+		 RETURNING room_id, status`,
+		newStatus, inspector, strings.TrimSpace(req.Notes), id, hotelID,
+	).Scan(&roomID, &status)
+	if err != nil {
+		// Either the task does not exist for this tenant, or it has not been
+		// completed. Both are a 409 rather than a 404: the caller can see the
+		// task on their board, so "not found" would be misleading.
+		return response.Error(c, fiber.StatusConflict,
+			"task not found for this property, or it has not been completed yet")
+	}
+
+	// A passed inspection is what returns the room to sale. The desk must not be
+	// able to sell a room the supervisor has not released, which is the whole
+	// point of having an inspection step.
+	if req.Passed {
+		if _, uErr := tenantPool(c, h.pool).Exec(c.Context(),
+			`UPDATE rooms SET status = 'available', updated_at = now()
+			  WHERE id = $1 AND hotel_id = $2 AND status = 'cleaning'`,
+			roomID, hotelID); uErr != nil {
+			return response.Error(c, fiber.StatusInternalServerError, "could not release the room")
+		}
+	}
+
+	return response.OK(c, fiber.Map{
+		"id": id, "status": status, "passed": req.Passed, "room_id": roomID,
+	})
+}
+
+// ListDue is the board for time-bound work: wake-up calls, scheduled bell-boy
+// pickups, anything with a promised time.
+//
+// Defaults to the next hour because that is the question a night desk actually
+// asks — "what do I owe someone soon" — and includes anything already overdue,
+// since a wake-up call missed by ten minutes is the one that most needs showing.
+func (h *HousekeepingHandler) ListDue(c *fiber.Ctx) error {
+	within := 60
+	if v := strings.TrimSpace(c.Query("within_minutes")); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 || n > 1440 {
+			return response.Error(c, fiber.StatusBadRequest,
+				"within_minutes must be a whole number of minutes between 0 and 1440")
+		}
+		within = n
+	}
+
+	rows, err := tenantPool(c, h.pool).Query(c.Context(), `
+		SELECT ha.id, ha.room_id, r.room_number, ha.guest_stay_id, gs.guest_name,
+		       ha.task_type, ha.priority, ha.status, ha.scheduled_for, ha.notes
+		  FROM housekeeping_assignments ha
+		  LEFT JOIN rooms r        ON r.id  = ha.room_id
+		  LEFT JOIN guest_stays gs ON gs.id = ha.guest_stay_id
+		 WHERE ha.hotel_id = $1
+		   AND ha.scheduled_for IS NOT NULL
+		   AND ha.status IN ('pending','in_progress')
+		   AND ha.scheduled_for <= now() + ($2 || ' minutes')::interval
+		 ORDER BY ha.scheduled_for`,
+		tenantHotelID(c), strconv.Itoa(within))
+	if err != nil {
+		return response.Error(c, fiber.StatusInternalServerError, "failed to list due tasks")
+	}
+	defer rows.Close()
+
+	out := make([]map[string]interface{}, 0)
+	for rows.Next() {
+		var (
+			id, roomID                     uuid.UUID
+			stayID                         *uuid.UUID
+			roomNumber, guestName, notes   *string
+			taskType, priority, taskStatus string
+			scheduledFor                   time.Time
+		)
+		if err := rows.Scan(&id, &roomID, &roomNumber, &stayID, &guestName,
+			&taskType, &priority, &taskStatus, &scheduledFor, &notes); err != nil {
+			return response.Error(c, fiber.StatusInternalServerError, "failed to read due tasks")
+		}
+		out = append(out, map[string]interface{}{
+			"id": id, "room_id": roomID, "room_number": roomNumber,
+			"guest_stay_id": stayID, "guest_name": guestName,
+			"task_type": taskType, "priority": priority, "status": taskStatus,
+			"scheduled_for": scheduledFor.Format(time.RFC3339),
+			"overdue":       scheduledFor.Before(time.Now()),
+			"notes":         notes,
+		})
+	}
+	return response.OK(c, out)
 }

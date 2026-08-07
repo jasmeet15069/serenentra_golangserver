@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"time"
 
@@ -155,6 +156,34 @@ type housekeepingRequest struct {
 	GuestStayID string `json:"guest_stay_id"`
 	RequestType string `json:"request_type"`
 	Notes       string `json:"notes"`
+	// RFC3339. A wake-up call is defined by its time, so without this the
+	// request records that one was asked for but not when for. Optional
+	// everywhere else, where it means "as soon as someone can".
+	ScheduledFor string `json:"scheduled_for"`
+	Priority     string `json:"priority"`
+}
+
+// guestRequestTypes are the request kinds the desk and the guest app may raise.
+// It deliberately excludes the operational task types (checkout_clean,
+// inspection, …) which the system raises for itself — a guest cannot ask for a
+// room to be marked inspected.
+//
+// Mirrors housekeeping_task_type_check in migration 028. A value outside it
+// used to be stored verbatim, so "wakeup", "wake up" and "Wake Up Call" were
+// three different things and no board could group them.
+var guestRequestTypes = map[string]bool{
+	"guest_request": true, "room_service": true, "wake_up_call": true,
+	"bell_boy": true, "luggage": true, "laundry_pickup": true,
+	"amenity_request": true, "linen_change": true, "turndown": true,
+}
+
+func guestRequestTypeList() string {
+	out := make([]string, 0, len(guestRequestTypes))
+	for k := range guestRequestTypes {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return strings.Join(out, ", ")
 }
 
 func (h *OperationsHandler) CreateGuestHousekeepingRequest(c *fiber.Ctx) error {
@@ -170,29 +199,66 @@ func (h *OperationsHandler) CreateGuestHousekeepingRequest(c *fiber.Ctx) error {
 	if err != nil {
 		return response.Error(c, fiber.StatusUnprocessableEntity, "guest_stay_id is required")
 	}
-	taskType := strings.TrimSpace(req.RequestType)
+	taskType := strings.ToLower(strings.TrimSpace(req.RequestType))
 	if taskType == "" {
 		taskType = "guest_request"
 	}
+	if !guestRequestTypes[taskType] {
+		return response.Error(c, fiber.StatusUnprocessableEntity,
+			"request_type must be one of: "+guestRequestTypeList())
+	}
 
-	var hotelID, roomID uuid.UUID
+	// A wake-up call with no time is a request nobody can action.
+	var scheduledFor *time.Time
+	if s := strings.TrimSpace(req.ScheduledFor); s != "" {
+		t, pErr := time.Parse(time.RFC3339, s)
+		if pErr != nil {
+			return response.Error(c, fiber.StatusUnprocessableEntity,
+				"scheduled_for must be RFC3339, e.g. 2026-08-08T06:30:00Z")
+		}
+		scheduledFor = &t
+	}
+	if taskType == "wake_up_call" && scheduledFor == nil {
+		return response.Error(c, fiber.StatusUnprocessableEntity,
+			"a wake_up_call requires scheduled_for")
+	}
+
+	priority := strings.ToLower(strings.TrimSpace(req.Priority))
+	switch priority {
+	case "low", "normal", "high", "urgent":
+	case "":
+		priority = "normal"
+	default:
+		return response.Error(c, fiber.StatusUnprocessableEntity,
+			"priority must be low, normal, high or urgent")
+	}
+
+	// Scoped to the caller's tenant. This looked the stay up by id alone, so an
+	// authenticated user of one hotel could pass another hotel's stay id and
+	// have the request created against that hotel's room — the id was trusted
+	// to identify the tenant rather than checked against it.
+	callerHotel := h.hotelID(c)
+	var roomID uuid.UUID
 	var guestID *uuid.UUID
 	err = h.pool.QueryRow(c.Context(),
-		`SELECT hotel_id, room_id, guest_id FROM guest_stays WHERE id = $1`,
-		stayID,
-	).Scan(&hotelID, &roomID, &guestID)
+		`SELECT room_id, guest_id FROM guest_stays WHERE id = $1 AND hotel_id = $2`,
+		stayID, callerHotel,
+	).Scan(&roomID, &guestID)
 	if err != nil {
 		return response.Error(c, fiber.StatusNotFound, "active stay not found")
 	}
+	hotelID := callerHotel
 
 	assignmentID := uuid.New()
 	var createdAt interface{}
 	err = h.pool.QueryRow(c.Context(), `
 		INSERT INTO housekeeping_assignments (
-			id, hotel_id, room_id, task_type, priority, status, notes, created_at, updated_at
-		) VALUES ($1,$2,$3,$4,'normal','pending',$5,now(),now())
+			id, hotel_id, room_id, guest_stay_id, task_type, priority, status,
+			notes, scheduled_for, created_at, updated_at
+		) VALUES ($1,$2,$3,$4,$5,$6,'pending',$7,$8,now(),now())
 		RETURNING created_at`,
-		assignmentID, hotelID, roomID, taskType, nullableText(req.Notes),
+		assignmentID, hotelID, roomID, stayID, taskType, priority,
+		nullableText(req.Notes), scheduledFor,
 	).Scan(&createdAt)
 	if err != nil {
 		return response.Error(c, fiber.StatusBadRequest, err.Error())
