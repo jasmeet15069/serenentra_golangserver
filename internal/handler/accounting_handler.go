@@ -105,10 +105,24 @@ type accountResp struct {
 	Order     int       `json:"display_order"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
+
+	// Balance is what the account is actually worth now: the opening balance
+	// plus everything posted to it. The list only ever returned opening_balance,
+	// which is 0 for every account nobody has explicitly seeded — so a chart of
+	// accounts sat at zero across the board while the trial balance showed real
+	// money, and it read as broken rather than as the wrong column.
+	//
+	// Signed by the account's natural side, so every balance reads positive the
+	// way an accountant expects: assets and expenses are debit-normal,
+	// liabilities, equity and revenue credit-normal.
+	Balance float64 `json:"balance"`
 }
 
+// INR, not USD. Every amount in this product is rupees — room rates, POS bills,
+// the GST the ledger posts — and the chart of accounts was the one screen
+// rendering them with a dollar sign because the column default said so.
 const accountCols = `id, code, name, type, COALESCE(sub_type,''), parent_code,
- opening_balance, COALESCE(currency,'USD'), is_active, display_order, created_at, updated_at`
+ opening_balance, COALESCE(NULLIF(currency,''),'INR'), is_active, display_order, created_at, updated_at`
 
 func scanAccount(r rowScanner, a *accountResp) error {
 	return r.Scan(&a.ID, &a.Code, &a.Name, &a.Type, &a.SubType, &a.Parent,
@@ -116,8 +130,23 @@ func scanAccount(r rowScanner, a *accountResp) error {
 }
 
 func (h *AccountingHandler) ListAccounts(c *fiber.Ctx) error {
-	rows, err := tenantPool(c, h.pool).Query(c.Context(),
-		`SELECT `+accountCols+` FROM accounting_accounts WHERE hotel_id = $1 ORDER BY display_order, code`, h.hotelID(c))
+	// GROUP BY a.id alone is enough: it is the primary key, so Postgres treats
+	// every other column of the table as functionally dependent on it.
+	rows, err := tenantPool(c, h.pool).Query(c.Context(), `
+		SELECT a.id, a.code, a.name, a.type, COALESCE(a.sub_type,''), a.parent_code,
+		       a.opening_balance, COALESCE(NULLIF(a.currency,''),'INR'), a.is_active,
+		       a.display_order, a.created_at, a.updated_at,
+		       a.opening_balance + COALESCE(SUM(
+		         CASE WHEN a.type IN ('asset','expense')
+		              THEN jl.debit - jl.credit
+		              ELSE jl.credit - jl.debit
+		         END), 0) AS balance
+		  FROM accounting_accounts a
+		  LEFT JOIN accounting_journal_lines jl
+		         ON jl.account_id = a.id AND jl.hotel_id = a.hotel_id
+		 WHERE a.hotel_id = $1
+		 GROUP BY a.id
+		 ORDER BY a.display_order, a.code`, h.hotelID(c))
 	if err != nil {
 		return response.Error(c, 500, err.Error())
 	}
@@ -125,7 +154,9 @@ func (h *AccountingHandler) ListAccounts(c *fiber.Ctx) error {
 	out := []accountResp{}
 	for rows.Next() {
 		var a accountResp
-		if err := scanAccount(rows, &a); err != nil {
+		if err := rows.Scan(&a.ID, &a.Code, &a.Name, &a.Type, &a.SubType, &a.Parent,
+			&a.OpenBal, &a.Currency, &a.Active, &a.Order, &a.CreatedAt, &a.UpdatedAt,
+			&a.Balance); err != nil {
 			return response.Error(c, 500, err.Error())
 		}
 		out = append(out, a)

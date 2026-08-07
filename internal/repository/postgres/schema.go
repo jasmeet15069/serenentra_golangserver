@@ -548,7 +548,7 @@ func (d *DB) EnsureAppSchema(ctx context.Context) error {
 			sub_type TEXT,
 			parent_code TEXT,
 			opening_balance NUMERIC(14,2) NOT NULL DEFAULT 0,
-			currency TEXT NOT NULL DEFAULT $$USD$$,
+			currency TEXT NOT NULL DEFAULT $$INR$$,
 			is_active BOOLEAN NOT NULL DEFAULT true,
 			display_order INT NOT NULL DEFAULT 0,
 			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -829,6 +829,13 @@ func (d *DB) EnsureAppSchema(ctx context.Context) error {
 			uploaded_by   UUID REFERENCES users(id) ON DELETE SET NULL,
 			created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
+		// Existing chart-of-accounts rows carry currency 'USD' because that was
+		// the column default, not because anybody chose it — this is a rupee
+		// product throughout. Only the untouched default is moved, so a tenant
+		// that has deliberately set something else keeps it.
+		`UPDATE accounting_accounts SET currency = 'INR' WHERE currency = 'USD'`,
+		`ALTER TABLE accounting_accounts ALTER COLUMN currency SET DEFAULT 'INR'`,
+
 		`CREATE INDEX IF NOT EXISTS idx_reservation_documents_stay
 			ON reservation_documents (hotel_id, guest_stay_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_reservation_documents_guest
