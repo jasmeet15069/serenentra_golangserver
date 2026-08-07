@@ -269,6 +269,26 @@ func TestPriceStay(t *testing.T) {
 		}
 	})
 
+	t.Run("clock times do not shorten calendar-night pricing", func(t *testing.T) {
+		// This is a two-night stay despite spanning only 45 elapsed hours.
+		// It covers the production case that used to quote two nights but create
+		// a one-night total after the arrival and departure times were applied.
+		clockIn, clockOut, err := resolveStayDates(createReservationRequest{
+			CheckInDate: "2026-08-10", CheckOutDate: "2026-08-12",
+			CheckInTime: "14:00", CheckOutTime: "11:00",
+		})
+		if err != nil {
+			t.Fatalf("resolve stay dates: %v", err)
+		}
+		q := priceStay(8000, clockIn, clockOut, 0, 0)
+		if q.Nights != 2 {
+			t.Errorf("Nights = %d, want 2", q.Nights)
+		}
+		if q.BaseTotal != 16000 {
+			t.Errorf("BaseTotal = %.2f, want 16000", q.BaseTotal)
+		}
+	})
+
 	t.Run("tax applied at the tenant's configured rate", func(t *testing.T) {
 		q := priceStay(2500, in, out, 18, 0)
 		if q.TaxAmount != 900 {

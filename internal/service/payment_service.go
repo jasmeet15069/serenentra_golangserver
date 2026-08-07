@@ -133,7 +133,7 @@ func bookingRoomLockKey(req BookingCheckoutRequest) (string, error) {
 }
 
 func bookingNights(checkIn, checkOut time.Time) int {
-	nights := int(checkOut.Sub(checkIn).Hours() / 24)
+	nights := domain.CalendarNights(checkIn, checkOut)
 	if nights < 1 {
 		return 1
 	}

@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/hotelharmony/api/internal/domain"
 	"github.com/hotelharmony/api/pkg/response"
 )
 
@@ -170,7 +171,7 @@ func (h *BookingHandler) SearchRooms(c *fiber.Ctx) error {
 
 	checkInTime, _ := time.Parse("2006-01-02", req.CheckIn)
 	checkOutTime, _ := time.Parse("2006-01-02", req.CheckOut)
-	totalNights := int(checkOutTime.Sub(checkInTime).Hours() / 24)
+	totalNights := domain.CalendarNights(checkInTime, checkOutTime)
 
 	items := make([]searchRoomItem, 0)
 	for rows.Next() {

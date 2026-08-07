@@ -167,7 +167,7 @@ func (h *ReservationHandler) List(c *fiber.Ctx) error {
 			"discount_amount":  s.DiscountAmount,
 			"tax_amount":       s.TaxAmount,
 			"payable":          s.Payable(),
-			"nights":           int(s.CheckOutDate.Sub(s.CheckInDate).Hours() / 24),
+			"nights":           domain.CalendarNights(s.CheckInDate, s.CheckOutDate),
 			"status":           resStatus,
 			"source":           coalesceStr(s.Source),
 			"approach_type":    s.ApproachType,
@@ -481,7 +481,7 @@ func (h *ReservationHandler) Create(c *fiber.Ctx) error {
 	if tErr != nil {
 		taxRate = 0
 	}
-	nights := int(checkOut.Sub(checkIn).Hours() / 24)
+	nights := domain.CalendarNights(checkIn, checkOut)
 
 	// Resolve the promo before pricing, so tax is charged on the discounted
 	// base. A code that the guest was quoted but which no longer applies fails
@@ -646,6 +646,25 @@ func (h *ReservationHandler) Update(c *fiber.Ctx) error {
 	// PATCH of only one date can't silently invert the stay (checkout before
 	// checkin).
 	if req.CheckInDate != "" || req.CheckOutDate != "" {
+		// A completed payment has already produced its invoice and journal entry.
+		// Editing the stay dates afterwards would make the reservation disagree
+		// with those immutable accounting records; require an explicit adjustment
+		// instead of silently changing the booked amount.
+		if h.db != nil {
+			var paid bool
+			if pErr := h.db.Querier(c.Context()).QueryRow(c.Context(), `
+				SELECT EXISTS(
+					SELECT 1 FROM payments
+					WHERE hotel_id = $1 AND guest_stay_id = $2 AND status = 'completed'
+				)`, hotelID, id).Scan(&paid); pErr != nil {
+				return response.Error(c, fiber.StatusInternalServerError, "failed to verify reservation settlement")
+			}
+			if paid {
+				return response.Error(c, fiber.StatusConflict,
+					"cannot change stay dates after payment; issue an adjustment instead")
+			}
+		}
+
 		effectiveCheckIn := current.CheckInDate
 		effectiveCheckOut := current.CheckOutDate
 		if req.CheckInDate != "" {
@@ -680,12 +699,18 @@ func (h *ReservationHandler) Update(c *fiber.Ctx) error {
 				effectiveCheckIn.Format("2006-01-02"), effectiveCheckOut.Format("2006-01-02")))
 		}
 
-		// Re-price. total_amount was previously left at whatever the original
-		// dates cost, so extending a two-night stay to seven kept the two-night
-		// price and the difference was never billed.
+		// Re-price an unsettled stay through the same calendar-night and GST
+		// calculation used by Quote and Create. Leaving tax stale here made a
+		// date change disagree with the amount eventually settled.
 		if room, rErr := h.roomRepo.FindRoomByID(c.Context(), hotelID, current.RoomID); rErr == nil {
-			nights := effectiveCheckOut.Sub(effectiveCheckIn).Hours() / 24
-			fields["total_amount"] = room.PricePerNight * nights
+			taxRate, tErr := h.roomRepo.HotelGSTRate(c.Context(), hotelID)
+			if tErr != nil {
+				taxRate = 0
+			}
+			quote := priceStay(room.PricePerNight, effectiveCheckIn, effectiveCheckOut, taxRate, current.DiscountAmount)
+			fields["total_amount"] = quote.BaseTotal
+			fields["discount_amount"] = quote.Discount
+			fields["tax_amount"] = quote.TaxAmount
 		}
 	}
 	if req.GuestName != "" {
@@ -1025,7 +1050,7 @@ type stayQuote struct {
 // Tax is charged on the discounted base, not the list price — discounting after
 // tax would overcharge the guest by the tax on the discount.
 func priceStay(roomRate float64, checkIn, checkOut time.Time, taxRate, discount float64) stayQuote {
-	nights := int(checkOut.Sub(checkIn).Hours() / 24)
+	nights := domain.CalendarNights(checkIn, checkOut)
 	if nights < 1 {
 		nights = 1
 	}
